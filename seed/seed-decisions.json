@@ -225,8 +225,8 @@
   },
   {
     "id": "d09201ba-b1e6-47c6-9767-d9bce0599d31",
-    "statement": "Sales may commit to API v1 support for enterprise renewals through December 2026.",
-    "rationale": null,
+    "statement": "Sales is authorized to guarantee enterprise customers full API v1 availability through December 2026.",
+    "rationale": "Several enterprise renewals hinge on v1 stability commitments.",
     "channel_id": "C0BG3JF1URZ",
     "channel_name": "acct-omega",
     "decided_by": "U0BGDH6LL6Q",
