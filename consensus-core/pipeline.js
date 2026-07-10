@@ -12,7 +12,7 @@
  */
 
 import { contradictionAlert, decisionCard } from './blocks.js';
-import { classifyDecision, judgeContradiction } from './judge.js';
+import { classifyDecisions, judgeContradiction } from './judge.js';
 import { addDecision, isKnownFalsePositive, listDecisions, recordEvent } from './ledger.js';
 import { canSeeDecision } from './permissions.js';
 import { searchContext } from './rts.js';
@@ -26,6 +26,9 @@ const CONTRADICTION_MIN_CONFIDENCE = 0.75;
 
 // Cap the number of contradiction candidates handed to the judge.
 const MAX_CANDIDATES = 50;
+
+// Cap the number of decisions captured from a single message.
+const MAX_CAPTURES_PER_MESSAGE = 5;
 
 /**
  * In-memory LRU of recently processed event ids (client_msg_id or ts). Slack
@@ -283,28 +286,33 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
   const startedAt = Date.now();
 
   try {
-    // (b) Is this message itself a finalized decision? (keyword-gated)
+    // (b) Does this message itself finalize one or more decisions? (keyword-gated)
+    // A single message can carry SEVERAL decisions (meeting-notes dumps); each is
+    // captured and gets its own card, all threaded under the source message.
     // Thread replies are only captured when clearly decisional — the keyword
     // gate already enforces that, so we simply follow decisionAdjacent.
-    let capturedId = null;
-    /** @type {{isDecision: boolean, statement: string|null, rationale: string|null, confidence: number}} */
-    let classification = { isDecision: false, statement: null, rationale: null, confidence: 0 };
+    /** @type {string[]} */
+    const capturedIds = [];
+    /** @type {Array<{statement: string, rationale: string|null, confidence: number}>} */
+    let classifications = [];
     if (decisionAdjacent) {
       const clsStart = Date.now();
-      classification = await classifyDecision(text);
+      classifications = await classifyDecisions(text);
       logger.info(
-        `[consensus] classifyDecision took ${Date.now() - clsStart}ms → isDecision=${classification.isDecision} conf=${classification.confidence}`,
+        `[consensus] classifyDecisions took ${Date.now() - clsStart}ms → ${classifications.length} candidate decision(s)`,
       );
     }
 
-    // Belt-and-braces: questions are never captured, even if the judge says so.
-    const captureOk =
-      classification.isDecision && classification.confidence >= DECISION_MIN_CONFIDENCE && !looksLikeQuestion(text);
-    if (classification.isDecision && looksLikeQuestion(text)) {
+    // Belt-and-braces: questions are never captured, even if the classifier says so.
+    const isQuestion = looksLikeQuestion(text);
+    if (classifications.length > 0 && isQuestion) {
       logger.info('[consensus] capture suppressed: message phrased as a question');
     }
+    const toCapture = isQuestion
+      ? []
+      : classifications.filter((c) => c.confidence >= DECISION_MIN_CONFIDENCE).slice(0, MAX_CAPTURES_PER_MESSAGE);
 
-    if (captureOk) {
+    if (toCapture.length > 0) {
       const [permalink, channelInfo] = await Promise.all([
         fetchPermalink(client, channelId, messageTs),
         fetchChannelInfo(client, channelId),
@@ -315,37 +323,46 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
         logger.info('[consensus] channel privacy unknown — treating as private (fail-closed)');
       }
       const isPrivate = channelInfo.isPrivate === false ? 0 : 1;
-      const decision = addDecision({
-        // Cap the captured statement so an over-long (or padded) classification
-        // can't bloat the ledger row or downstream renders.
-        statement: (classification.statement || text.slice(0, 280)).slice(0, 500),
-        rationale: classification.rationale,
-        channel_id: channelId,
-        channel_name: channelInfo.name,
-        decided_by: event.user,
-        message_ts: messageTs,
-        permalink,
-        confidence: classification.confidence,
-        is_private: isPrivate,
-      });
-      capturedId = decision.id;
-      recordEvent('captured', decision.id);
 
-      try {
-        await client.chat.postMessage({
-          channel: channelId,
-          thread_ts: threadTs,
-          text: `📌 Decision captured: ${decision.statement}`,
-          blocks: decisionCard({
-            statement: decision.statement,
-            decidedBy: decision.decided_by,
-            channelName: decision.channel_name,
-            permalink: decision.permalink,
-            id: decision.id,
-          }),
+      for (const c of toCapture) {
+        const decision = addDecision({
+          // Cap the captured statement so an over-long (or padded) classification
+          // can't bloat the ledger row or downstream renders.
+          statement: (c.statement || text.slice(0, 280)).slice(0, 500),
+          rationale: c.rationale,
+          channel_id: channelId,
+          channel_name: channelInfo.name,
+          decided_by: event.user,
+          message_ts: messageTs,
+          permalink,
+          confidence: c.confidence,
+          is_private: isPrivate,
         });
-      } catch (e) {
-        logger.error(`[consensus] failed to post decision card: ${e}`);
+        capturedIds.push(decision.id);
+        recordEvent('captured', decision.id);
+
+        try {
+          // One card per captured decision, all threaded under the source message
+          // (they stack in-thread).
+          await client.chat.postMessage({
+            channel: channelId,
+            thread_ts: threadTs,
+            text: `📌 Decision captured: ${decision.statement}`,
+            blocks: decisionCard({
+              statement: decision.statement,
+              decidedBy: decision.decided_by,
+              channelName: decision.channel_name,
+              permalink: decision.permalink,
+              id: decision.id,
+            }),
+          });
+        } catch (e) {
+          logger.error(`[consensus] failed to post decision card: ${e}`);
+        }
+      }
+
+      if (toCapture.length > 1) {
+        logger.info(`[consensus] captured ${toCapture.length} decision(s) from one message`);
       }
     }
 
@@ -356,7 +373,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     const candidates = listDecisions({ status: 'active', limit: 30 })
       .filter(
         (d) =>
-          d.id !== capturedId &&
+          !capturedIds.includes(d.id) &&
           d.message_ts !== threadTs &&
           (d.channel_id !== channelId || d.message_ts !== messageTs),
       )
