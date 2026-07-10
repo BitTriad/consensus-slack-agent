@@ -1,0 +1,65 @@
+name: Run Consensus agent
+
+# Consensus connects to Slack via Socket Mode (outbound WebSocket), so it can
+# run entirely inside a GitHub Actions runner — no inbound URL required.
+# A scheduled run starts every 5 hours; each run holds the connection for
+# ~5h50m and then exits, letting the next scheduled run take over.
+# The decision ledger (consensus.db) is persisted between runs via the cache.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '15 */5 * * *'
+
+concurrency:
+  group: consensus-agent
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    # Scheduled runs only serve when the repo variable AGENT_ENABLED is 'true'
+    # (set it on submission day). Manual dispatch always runs, for testing.
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.AGENT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Restore decision ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            consensus.db
+            consensus.db-wal
+            consensus.db-shm
+          key: consensus-ledger-${{ github.run_id }}
+          restore-keys: |
+            consensus-ledger-
+
+      - run: npm ci
+
+      - name: Run agent (Socket Mode)
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Run for at most 5h50m, then exit 0 so the next scheduled run takes over.
+          timeout 21000 node app.js || code=$?
+          if [ "${code:-0}" = "124" ]; then echo "planned handover"; exit 0; fi
+          exit "${code:-0}"
+
+      - name: Save decision ledger
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            consensus.db
+            consensus.db-wal
+            consensus.db-shm
+          key: consensus-ledger-${{ github.run_id }}
