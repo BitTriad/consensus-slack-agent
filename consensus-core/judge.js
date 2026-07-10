@@ -94,8 +94,9 @@ async function completeJson(prompt, system) {
 
 const CLASSIFY_SYSTEM =
   'You are a precise classifier that extracts every settled TEAM DECISION stated in a Slack message. ' +
-  'A single message may contain SEVERAL decisions (e.g. a meeting-notes recap: "moving to X, pricing is now Y, ' +
-  'hiring frozen till Z") — extract each distinct one separately. ' +
+  'A single message may contain SEVERAL DIFFERENT decisions (e.g. a meeting-notes recap: "moving to X, pricing is now Y, ' +
+  'hiring frozen till Z") — extract each distinct one separately, EXACTLY ONCE. ' +
+  'Never repeat or rephrase the same decision as multiple entries, and never split one decision into several. ' +
   'A decision is a settled, committed choice the team is now acting on (e.g. "we\'re standardizing on Postgres", ' +
   '"approved, ship Friday", "we\'ve decided to freeze hiring"). ' +
   'NOT decisions: questions, proposals still under debate, opinions, suggestions, musings, jokes/sarcasm, ' +
@@ -108,27 +109,51 @@ const CLASSIFY_SYSTEM =
 const MAX_DECISIONS = 5;
 
 /**
- * Normalize the raw parsed classifier output into a clean, capped decisions
- * array. Safe against malformed shapes — returns [] rather than throwing.
- * Entries without a usable statement are dropped; the result is capped at
- * {@link MAX_DECISIONS} (extras ignored).
+ * Canonical key for dedup: lowercase, collapse internal whitespace, strip
+ * surrounding whitespace and trailing punctuation. Two entries that reduce to
+ * the same key are treated as the SAME decision (e.g. a model that emits
+ * "Docs are moving to Docusaurus" and "docs are moving to Docusaurus." twice).
+ * @param {string} statement
+ * @returns {string}
+ */
+function dedupKey(statement) {
+  return statement
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.,;:!?\s]+$/, '');
+}
+
+/**
+ * Normalize the raw parsed classifier output into a clean, deduplicated, capped
+ * decisions array. Safe against malformed shapes — returns [] rather than
+ * throwing. Entries without a usable statement are dropped; entries whose
+ * statements normalize to the same {@link dedupKey} are collapsed to a SINGLE
+ * entry keeping the highest-confidence one (guarding against duplicate cards
+ * regardless of any model's output). The result is capped at
+ * {@link MAX_DECISIONS} (extras ignored), applied AFTER dedup so duplicates
+ * never consume the cap budget.
  * @param {any} parsed
  * @returns {Array<{statement: string, rationale: string|null, confidence: number}>}
  */
 export function normalizeDecisions(parsed) {
   if (!parsed || !Array.isArray(parsed.decisions)) return [];
-  /** @type {Array<{statement: string, rationale: string|null, confidence: number}>} */
-  const out = [];
+  /** @type {Map<string, {statement: string, rationale: string|null, confidence: number}>} */
+  const byKey = new Map();
   for (const d of parsed.decisions) {
     if (!d || typeof d !== 'object') continue;
     const statement = typeof d.statement === 'string' ? d.statement.trim() : '';
     if (!statement) continue;
     const rationale = typeof d.rationale === 'string' && d.rationale.trim() ? d.rationale.trim() : null;
     const confidence = typeof d.confidence === 'number' ? d.confidence : 0;
-    out.push({ statement, rationale, confidence });
-    if (out.length >= MAX_DECISIONS) break;
+    const key = dedupKey(statement);
+    const existing = byKey.get(key);
+    // Keep the highest-confidence variant; preserve first-seen insertion order.
+    if (!existing || confidence > existing.confidence) {
+      byKey.set(key, { statement, rationale, confidence });
+    }
   }
-  return out;
+  return Array.from(byKey.values()).slice(0, MAX_DECISIONS);
 }
 
 /**
@@ -155,6 +180,8 @@ Rules:
 - EXCLUDE questions, proposals still under debate, opinions, suggestions, jokes/sarcasm,
   hypotheticals, and requests to reopen/revisit a decision.
 - Split distinct decisions into SEPARATE array entries; do not merge unrelated choices.
+- Emit each distinct decision EXACTLY ONCE — never repeat or rephrase the same decision as two entries.
+- A message may contain SEVERAL DIFFERENT decisions — extract each one separately, and do not miss any.
 - Messy, casual, typo-ridden, or non-native-English phrasing still counts.
 - If there are no settled decisions, return an empty array.
 

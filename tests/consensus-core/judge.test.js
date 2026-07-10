@@ -69,6 +69,50 @@ describe('classifier array parsing (normalizeDecisions)', () => {
     });
     assert.deepStrictEqual(out, [{ statement: 'X', rationale: null, confidence: 0 }]);
   });
+
+  it('dedupes entries that normalize to the same statement, keeping the highest confidence', () => {
+    const out = normalizeDecisions({
+      decisions: [
+        { statement: 'Docs are moving to Docusaurus', rationale: null, confidence: 0.8 },
+        { statement: 'docs are moving to docusaurus.', rationale: 'clarity', confidence: 0.92 },
+        { statement: '  Docs are moving   to Docusaurus!!! ', rationale: null, confidence: 0.5 },
+      ],
+    });
+    assert.strictEqual(out.length, 1);
+    assert.deepStrictEqual(out[0], {
+      statement: 'docs are moving to docusaurus.',
+      rationale: 'clarity',
+      confidence: 0.92,
+    });
+  });
+
+  it('keeps DISTINCT decisions from the same message separate', () => {
+    const out = normalizeDecisions({
+      decisions: [
+        { statement: 'Docs are moving to Docusaurus', rationale: null, confidence: 0.9 },
+        { statement: 'Daily standups go async on Mondays', rationale: null, confidence: 0.88 },
+      ],
+    });
+    assert.strictEqual(out.length, 2);
+    assert.deepStrictEqual(
+      out.map((d) => d.statement),
+      ['Docs are moving to Docusaurus', 'Daily standups go async on Mondays'],
+    );
+  });
+
+  it('dedup runs BEFORE the cap so duplicates do not consume the cap budget', () => {
+    const out = normalizeDecisions({
+      decisions: [
+        { statement: 'Dupe', confidence: 0.9 },
+        { statement: 'dupe.', confidence: 0.9 },
+        ...Array.from({ length: 6 }, (_, i) => ({ statement: `Decision ${i + 1}`, confidence: 0.9 })),
+      ],
+    });
+    // 1 (deduped) + 6 distinct = 7 unique → capped at 5.
+    assert.strictEqual(out.length, 5);
+    assert.strictEqual(out[0].statement, 'Dupe');
+    assert.strictEqual(out[4].statement, 'Decision 4');
+  });
 });
 
 describe('legacy wrapper shape (firstDecisionLegacyShape)', () => {

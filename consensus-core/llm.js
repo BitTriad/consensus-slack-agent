@@ -8,15 +8,17 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
  * If `GEMINI_API_KEY` is set, Google Gemini's REST API is used instead.
  *
  * @param {string} prompt - The user prompt.
- * @param {{ system?: string }} [opts]
+ * @param {{ system?: string, temperature?: number }} [opts]
+ *   `temperature` is an optional sampling temperature (0..1). It is honored by
+ *   the hosted providers (Cerebras/Gemini); the local Claude SDK path ignores it.
  * @returns {Promise<string>} The model's text response.
  */
-export async function llmComplete(prompt, { system } = {}) {
+export async function llmComplete(prompt, { system, temperature } = {}) {
   if (process.env.CEREBRAS_API_KEY) {
-    return cerebrasComplete(prompt, system);
+    return cerebrasComplete(prompt, system, temperature);
   }
   if (process.env.GEMINI_API_KEY) {
-    return geminiComplete(prompt, system);
+    return geminiComplete(prompt, system, temperature);
   }
   return claudeComplete(prompt, system);
 }
@@ -27,12 +29,23 @@ const CEREBRAS_MODEL = process.env.CEREBRAS_MODEL || 'zai-glm-4.7';
  * Cerebras inference (OpenAI-compatible chat completions).
  * @param {string} prompt
  * @param {string} [system]
+ * @param {number} [temperature]
  * @returns {Promise<string>}
  */
-async function cerebrasComplete(prompt, system) {
+async function cerebrasComplete(prompt, system, temperature) {
   const messages = [];
   if (system) messages.push({ role: 'system', content: system });
   messages.push({ role: 'user', content: prompt });
+
+  // zai-glm-4.7 is a REASONING model: it spends "reasoning" tokens that also
+  // count against max_completion_tokens, and only then emits the answer in
+  // `content`. A ceiling of 2000 let deliberation over a subtle multi-way
+  // comparison (e.g. an audit scan) consume the entire budget, truncating before
+  // any content was produced — the API returned an EMPTY content string. Give
+  // reasoning + answer ample headroom so the JSON is always emitted.
+  /** @type {Record<string, any>} */
+  const payload = { model: CEREBRAS_MODEL, messages, max_completion_tokens: 8000 };
+  if (typeof temperature === 'number') payload.temperature = temperature;
 
   // Free-tier requests-per-minute limits surface as 429s under bursts (e.g.
   // the eval harness) — retry with backoff before giving up.
@@ -44,7 +57,7 @@ async function cerebrasComplete(prompt, system) {
         Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ model: CEREBRAS_MODEL, messages, max_completion_tokens: 2000 }),
+      body: JSON.stringify(payload),
     });
     if (res.status === 429 && attempt < MAX_ATTEMPTS) {
       const retryAfter = Number(res.headers.get('retry-after')) || attempt * 15;
@@ -89,13 +102,15 @@ const GEMINI_MODEL = 'gemini-2.0-flash';
 /**
  * @param {string} prompt
  * @param {string} [system]
+ * @param {number} [temperature]
  * @returns {Promise<string>}
  */
-async function geminiComplete(prompt, system) {
+async function geminiComplete(prompt, system, temperature) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
   /** @type {Record<string, any>} */
   const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }] };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
+  if (typeof temperature === 'number') body.generationConfig = { temperature };
 
   const res = await fetch(url, {
     method: 'POST',
