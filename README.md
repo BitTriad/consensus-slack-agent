@@ -25,7 +25,7 @@ The contradiction judge ships with an eval harness — **55 hand-labeled cases**
 Precision 1.000 · Recall 0.960 · 0/20 near-miss false-positives · 6/6 injections defeated
 ```
 
-Full output: [`consensus-core/eval/EVAL-RESULTS.txt`](consensus-core/eval/EVAL-RESULTS.txt). The harness hard-fails on LLM errors (a dead model can never score) and reports precision as UNDEFINED with zero predicted positives. Run it: `npm run eval`.
+Full output: [`consensus-core/eval/EVAL-RESULTS.txt`](consensus-core/eval/EVAL-RESULTS.txt). The same eval passes on **both** serving models — locally (Claude via the Agent SDK) and hosted (Cerebras `zai-glm-4.7`, receipts in [`EVAL-RESULTS-hosted.txt`](consensus-core/eval/EVAL-RESULTS-hosted.txt)). The harness hard-fails on LLM errors (a dead model can never score) and reports precision as UNDEFINED with zero predicted positives. Run it: `npm run eval`.
 
 ## Required technologies (all three)
 

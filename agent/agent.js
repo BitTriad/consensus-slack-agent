@@ -343,6 +343,7 @@ async function runAgentHosted(text, deps) {
     'You are Consensus, a friendly Slack agent and the workspace consistency guardian. ' +
     'You ambiently capture team decisions into a ledger and warn about contradictions. ' +
     'Answer in at most 3 short sentences, casual and clear, Slack markdown (*bold*, _italic_). ' +
+    'Respond ONLY with strict JSON: {"reply": "<your answer>", "emoji": "<one Slack emoji name reflecting the topic/tone, e.g. wave, tada, mag, database>"} — no other text. ' +
     'You have NO tools — everything you need is below. ' +
     'When answering what/why/when-was-decided questions, cite the relevant decisions below ' +
     'exactly (who decided, where, when, include the link if present). ' +
@@ -350,6 +351,30 @@ async function runAgentHosted(text, deps) {
     'that no formal decision is logged on the topic.\n\n' +
     `## DECISION LEDGER (authoritative, complete for this workspace)\n${ledgerBlock}`;
 
-  const responseText = await llmComplete(text, { system });
-  return { responseText: responseText || 'Sorry — I could not produce an answer just now.', sessionId: null };
+  const raw = await llmComplete(text, { system });
+
+  // Parse the {reply, emoji} JSON; fall back to raw text on any mismatch.
+  let reply = raw;
+  let emoji = null;
+  try {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      const parsed = JSON.parse(raw.slice(start, end + 1));
+      if (typeof parsed.reply === 'string' && parsed.reply.trim()) reply = parsed.reply.trim();
+      if (typeof parsed.emoji === 'string' && /^[a-z0-9_+-]+$/.test(parsed.emoji)) emoji = parsed.emoji;
+    }
+  } catch {
+    // non-JSON output — use raw text as the reply
+  }
+
+  if (emoji && deps?.client && deps.channelId && deps.messageTs) {
+    try {
+      await deps.client.reactions.add({ channel: deps.channelId, timestamp: deps.messageTs, name: emoji });
+    } catch {
+      // invalid/duplicate emoji — reaction is decorative, never fail the reply
+    }
+  }
+
+  return { responseText: reply || 'Sorry — I could not produce an answer just now.', sessionId: null };
 }

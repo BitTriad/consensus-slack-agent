@@ -21,7 +21,7 @@ export async function llmComplete(prompt, { system } = {}) {
   return claudeComplete(prompt, system);
 }
 
-const CEREBRAS_MODEL = process.env.CEREBRAS_MODEL || 'gpt-oss-120b';
+const CEREBRAS_MODEL = process.env.CEREBRAS_MODEL || 'zai-glm-4.7';
 
 /**
  * Cerebras inference (OpenAI-compatible chat completions).
@@ -34,19 +34,29 @@ async function cerebrasComplete(prompt, system) {
   if (system) messages.push({ role: 'system', content: system });
   messages.push({ role: 'user', content: prompt });
 
-  const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model: CEREBRAS_MODEL, messages, max_completion_tokens: 2000 }),
-  });
-  if (!res.ok) {
-    throw new Error(`Cerebras API error ${res.status}: ${await res.text()}`);
+  // Free-tier requests-per-minute limits surface as 429s under bursts (e.g.
+  // the eval harness) — retry with backoff before giving up.
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: CEREBRAS_MODEL, messages, max_completion_tokens: 2000 }),
+    });
+    if (res.status === 429 && attempt < MAX_ATTEMPTS) {
+      const retryAfter = Number(res.headers.get('retry-after')) || attempt * 15;
+      await new Promise((r) => setTimeout(r, retryAfter * 1000));
+      continue;
+    }
+    if (!res.ok) {
+      throw new Error(`Cerebras API error ${res.status}: ${await res.text()}`);
+    }
+    const data = await res.json();
+    return (data?.choices?.[0]?.message?.content || '').trim();
   }
-  const data = await res.json();
-  return (data?.choices?.[0]?.message?.content || '').trim();
 }
 
 /**
