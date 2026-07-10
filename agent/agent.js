@@ -1,6 +1,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { listDecisions } from '../consensus-core/ledger.js';
+import { llmComplete } from '../consensus-core/llm.js';
 import { canSeeDecision, isChannelMember } from '../consensus-core/permissions.js';
 import { searchContext } from '../consensus-core/rts.js';
 
@@ -113,6 +114,13 @@ const SLACK_MCP_URL = 'https://mcp.slack.com/mcp';
  * @returns {Promise<{responseText: string, sessionId: string | null}>}
  */
 export async function runAgent(text, sessionId = undefined, deps = undefined) {
+  // CLOUD MODE: when a hosted-provider key is present (GitHub Actions runner),
+  // the Claude Agent SDK has no local login — answer via the provider chain
+  // with ledger context inlined instead of tool calls.
+  if (process.env.CEREBRAS_API_KEY || process.env.GEMINI_API_KEY) {
+    return runAgentHosted(text, deps);
+  }
+
   const addEmojiReactionTool = tool(
     'add_emoji_reaction',
     EMOJI_DESCRIPTION,
@@ -286,4 +294,62 @@ export async function runAgent(text, sessionId = undefined, deps = undefined) {
 
   const responseText = responseParts.join('\n');
   return { responseText, sessionId: newSessionId };
+}
+
+/**
+ * Hosted-provider chat path (no Claude Agent SDK). Answers with the same
+ * persona and grounds provenance questions by inlining permission-filtered
+ * ledger matches directly into the prompt. Stateless (no session resume).
+ * @param {string} text
+ * @param {AgentDeps} [deps]
+ * @returns {Promise<{responseText: string, sessionId: string | null}>}
+ */
+async function runAgentHosted(text, deps) {
+  // Keyword match over the ledger, mirroring the lookup_decisions tool.
+  const terms = (text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9$]+/)
+    .filter((t) => t.length > 2)
+    .map((t) => t.replace(/s$/, ''));
+  const all = listDecisions({ limit: 200 });
+  // Small ledgers are inlined wholesale — keyword matching only kicks in at
+  // scale, so synonym gaps ("databases" vs "Postgres") can't hide decisions.
+  const matched =
+    all.length <= 25
+      ? all
+      : all.filter((d) => {
+          const hay = `${d.statement} ${d.rationale ?? ''}`.toLowerCase();
+          return terms.some((t) => hay.includes(t));
+        });
+
+  const visible = [];
+  for (const d of matched) {
+    if (!d.is_private) visible.push(d);
+    else if (deps?.client && deps.userId && (await canSeeDecision(deps.client, d, deps.userId))) visible.push(d);
+    if (visible.length >= 25) break;
+  }
+
+  const ledgerBlock =
+    visible.length === 0
+      ? '(no ledger matches for this message)'
+      : visible
+          .map((d) => {
+            const where = d.channel_name ? `#${d.channel_name}` : d.channel_id;
+            return `- [${d.status}] ${d.statement} — decided by <@${d.decided_by}> in ${where} on ${d.created_at}${d.permalink ? ` (link: ${d.permalink})` : ''}`;
+          })
+          .join('\n');
+
+  const system =
+    'You are Consensus, a friendly Slack agent and the workspace consistency guardian. ' +
+    'You ambiently capture team decisions into a ledger and warn about contradictions. ' +
+    'Answer in at most 3 short sentences, casual and clear, Slack markdown (*bold*, _italic_). ' +
+    'You have NO tools — everything you need is below. ' +
+    'When answering what/why/when-was-decided questions, cite the relevant decisions below ' +
+    'exactly (who decided, where, when, include the link if present). ' +
+    'Never invent a decision that is not listed. If nothing below is relevant, say plainly ' +
+    'that no formal decision is logged on the topic.\n\n' +
+    `## DECISION LEDGER (authoritative, complete for this workspace)\n${ledgerBlock}`;
+
+  const responseText = await llmComplete(text, { system });
+  return { responseText: responseText || 'Sorry — I could not produce an answer just now.', sessionId: null };
 }
