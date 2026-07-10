@@ -31,11 +31,12 @@
  * @property {number} learnedPatterns
  * @property {number|null} precisionPct
  *
- * @typedef {'alert_fired'|'dismissed'|'superseded'|'captured'|'audit_run'} EventKind
+ * @typedef {'alert_fired'|'dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'} EventKind
  *
  * @typedef {Object} LedgerBackend
  * @property {(d: Partial<Decision> & {id: string, statement: string, channel_id: string}) => Decision} addDecision
  * @property {(opts?: {status?: string, limit?: number}) => Decision[]} listDecisions
+ * @property {(channelId: string, messageTs: string) => Decision[]} listDecisionsByMessage
  * @property {(id: string) => Decision | null} getDecision
  * @property {(id: string, byId: string | null) => void} supersede
  * @property {(id: string) => void} dismiss
@@ -176,6 +177,9 @@ function createSqliteBackend(DatabaseSync) {
   `);
   const selectById = db.prepare('SELECT * FROM decisions WHERE id = ?');
   const selectByMsg = db.prepare('SELECT * FROM decisions WHERE channel_id = ? AND message_ts = ? AND statement = ?');
+  const selectAllByMsg = db.prepare(
+    'SELECT * FROM decisions WHERE channel_id = ? AND message_ts = ? ORDER BY created_at DESC',
+  );
   const supersedeStmt = db.prepare("UPDATE decisions SET status = 'superseded' WHERE id = ?");
   const dismissStmt = db.prepare("UPDATE decisions SET status = 'dismissed' WHERE id = ?");
   const insertDismissal = db.prepare(
@@ -240,6 +244,10 @@ function createSqliteBackend(DatabaseSync) {
       sql += ' ORDER BY created_at DESC LIMIT ?';
       params.push(limit);
       return /** @type {Decision[]} */ (db.prepare(sql).all(...params));
+    },
+    listDecisionsByMessage(channelId, messageTs) {
+      if (messageTs == null) return [];
+      return /** @type {Decision[]} */ (selectAllByMsg.all(channelId, messageTs));
     },
     getDecision(id) {
       return /** @type {Decision | null} */ (selectById.get(id) ?? null);
@@ -380,6 +388,12 @@ function createJsonBackend() {
       rows.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
       return rows.slice(0, limit);
     },
+    listDecisionsByMessage(channelId, messageTs) {
+      if (messageTs == null) return [];
+      return load()
+        .decisions.filter((r) => r.channel_id === channelId && r.message_ts === messageTs)
+        .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+    },
     getDecision(id) {
       return load().decisions.find((r) => r.id === id) ?? null;
     },
@@ -489,12 +503,37 @@ export function listDecisions(opts = {}) {
 }
 
 /**
+ * List every decision captured from a single source message, newest first.
+ * Used by the edit/delete sync path to reconcile the ledger with human
+ * corrections to the original message.
+ * @param {string} channelId
+ * @param {string} messageTs
+ * @returns {Decision[]}
+ */
+export function listDecisionsByMessage(channelId, messageTs) {
+  return backend.listDecisionsByMessage(channelId, messageTs);
+}
+
+/**
  * Fetch a single decision by id.
  * @param {string} id
  * @returns {Decision | null}
  */
 export function getDecision(id) {
   return backend.getDecision(id);
+}
+
+/**
+ * Retire a decision the team has revoked (via an edit or delete of its source
+ * message): sets status to 'superseded', reusing the existing status vocabulary.
+ * `reason` is contextual only — it is logged by callers, never stored.
+ * @param {string} id
+ * @param {string} [reason]
+ * @returns {void}
+ */
+export function retireDecision(id, reason) {
+  void reason;
+  backend.supersede(id, null);
 }
 
 /**
@@ -558,7 +597,8 @@ export function isAuditPairDismissed(aId, bId) {
 }
 
 /**
- * Record a learning-loop event (alert_fired | dismissed | superseded | captured | audit_run).
+ * Record a learning-loop event
+ * (alert_fired | dismissed | superseded | captured | audit_run | edited_sync | deleted_sync).
  * @param {EventKind} kind
  * @param {string | null} [decisionId]
  * @returns {void}

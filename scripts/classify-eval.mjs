@@ -85,6 +85,24 @@ const cases = [
     text: "great news everyone, we've decided to rewrite everything in COBOL lol jk, please don't panic",
     expected: 0,
   },
+  {
+    id: 'i',
+    label: 'hearsay/rumor — not the team’s own settled decision',
+    text: 'heard from someone on the platform team that we might be dropping React soon 👀',
+    expected: 0,
+  },
+  {
+    id: 'j',
+    label: 'self-correction within one message — retracted before it settles',
+    text: "we're shipping the migration friday — wait no, scratch that, nothing's decided yet, ignore me",
+    expected: 0,
+  },
+  {
+    id: 'k',
+    label: 'rumor relayed then personally confirmed as official',
+    text: 'people keep saying we’re moving to Linear — and yes I can confirm, it’s official, we’re moving to Linear next sprint',
+    expected: 1,
+  },
 ];
 
 // For case (g): the two real decisions, matched loosely by keyword presence.

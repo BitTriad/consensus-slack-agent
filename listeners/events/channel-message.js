@@ -1,8 +1,10 @@
-import { handleChannelMessage } from '../../consensus-core/pipeline.js';
+import { handleChannelMessage, handleMessageDeleted, handleMessageEdited } from '../../consensus-core/pipeline.js';
 
-// Subtypes we explicitly ignore: edits, deletes, joins/leaves, bot posts, etc.
-// Anything with no subtype is normal text; `thread_broadcast` (a reply also sent
-// to the channel) is likewise treated as normal decisional text.
+// Subtypes we explicitly ignore for the normal (as-text) capture path.
+// `message_changed` / `message_deleted` are NOT fed as text — they are routed
+// to the dedicated ledger-sync handlers below. Anything with no subtype is
+// normal text; `thread_broadcast` (a reply also sent to the channel) is
+// likewise treated as normal decisional text.
 const IGNORED_SUBTYPES = new Set([
   'message_changed',
   'message_deleted',
@@ -39,6 +41,25 @@ function isProcessableMessage(event) {
  * @returns {Promise<void>}
  */
 export async function handleChannelMessageEvent({ client, event, logger }) {
+  // Edits/deletes: route to the ledger-sync handlers (channel/group only) so a
+  // human correction to a captured message keeps the ledger honest.
+  const subtype = 'subtype' in event ? event.subtype : undefined;
+  if (event.channel_type === 'channel' || event.channel_type === 'group') {
+    if (subtype === 'message_changed') {
+      const changed = /** @type {any} */ (event);
+      const inner = changed.message;
+      // Human-authored originals only: inner author present, no bot on either level.
+      if (inner && !inner.bot_id && !changed.bot_id && inner.user) {
+        await handleMessageEdited({ event: changed, client, logger });
+      }
+      return;
+    }
+    if (subtype === 'message_deleted') {
+      await handleMessageDeleted({ event: /** @type {any} */ (event), logger });
+      return;
+    }
+  }
+
   // Only real, human channel/group messages (edits/deletes/joins ignored).
   if (!isProcessableMessage(event)) return;
   if (event.bot_id) return;

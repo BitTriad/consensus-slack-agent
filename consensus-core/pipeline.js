@@ -13,7 +13,14 @@
 
 import { contradictionAlert, decisionCard } from './blocks.js';
 import { classifyDecisions, judgeContradiction } from './judge.js';
-import { addDecision, isKnownFalsePositive, listDecisions, recordEvent } from './ledger.js';
+import {
+  addDecision,
+  isKnownFalsePositive,
+  listDecisions,
+  listDecisionsByMessage,
+  recordEvent,
+  retireDecision,
+} from './ledger.js';
 import { canSeeDecision } from './permissions.js';
 import { searchContext } from './rts.js';
 
@@ -117,6 +124,60 @@ function looksLikeQuestion(text) {
   const t = (text || '').trim().toLowerCase();
   if (t.endsWith('?')) return true;
   return /^(should|shall|do|does|can|could|would|are|is|what|why|when|where|how|who)\b.*\bwe\b/.test(t);
+}
+
+/**
+ * Canonical key for reconciling statements across an edit: lowercase, collapse
+ * internal whitespace, strip surrounding whitespace and trailing punctuation.
+ * Mirrors the classifier's dedupe guard (judge.js `dedupKey`) so two phrasings
+ * that the capture path treats as the SAME decision also reconcile as unchanged.
+ * @param {string} statement
+ * @returns {string}
+ */
+function normStatement(statement) {
+  return String(statement ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.,;:!?\s]+$/, '');
+}
+
+/**
+ * Pure reconcile diff between the statements captured BEFORE an edit and the
+ * statements classified AFTER it, compared under {@link normStatement}:
+ *   - kept:    present in BOTH (returned from `before`, original casing)
+ *   - retired: present in `before` but no longer in `after`
+ *   - added:   newly present in `after`
+ * Duplicate statements within a side are collapsed by normalized key. Safe
+ * against non-array / non-string input (treated as empty).
+ * @param {string[]} before
+ * @param {string[]} after
+ * @returns {{kept: string[], retired: string[], added: string[]}}
+ */
+export function diffStatements(before = [], after = []) {
+  /** @type {Map<string, string>} */
+  const beforeKeys = new Map();
+  for (const s of Array.isArray(before) ? before : []) {
+    const k = normStatement(s);
+    if (k && !beforeKeys.has(k)) beforeKeys.set(k, s);
+  }
+  /** @type {Map<string, string>} */
+  const afterKeys = new Map();
+  for (const s of Array.isArray(after) ? after : []) {
+    const k = normStatement(s);
+    if (k && !afterKeys.has(k)) afterKeys.set(k, s);
+  }
+  /** @type {string[]} */ const kept = [];
+  /** @type {string[]} */ const retired = [];
+  /** @type {string[]} */ const added = [];
+  for (const [k, s] of beforeKeys) {
+    if (afterKeys.has(k)) kept.push(s);
+    else retired.push(s);
+  }
+  for (const [k, s] of afterKeys) {
+    if (!beforeKeys.has(k)) added.push(s);
+  }
+  return { kept, retired, added };
 }
 
 /**
@@ -456,4 +517,199 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
   } catch (e) {
     logger.error(`[consensus] pipeline error (non-fatal): ${e}`);
   }
+}
+
+/**
+ * Handle an edit (`message_changed`) of a human-authored channel message: keep
+ * the ledger in sync with the corrected text. Cheap when the edited message
+ * never produced a decision (no prior captures → no LLM). Serialized behind the
+ * same per-channel queue as fresh captures.
+ * @param {{
+ *   event: any,
+ *   client: import('@slack/web-api').WebClient,
+ *   logger: import('@slack/bolt').Logger
+ * }} args
+ * @returns {Promise<void>}
+ */
+export async function handleMessageEdited({ event, client, logger }) {
+  const message = event.message || {};
+  // Human-authored originals only (defense-in-depth; the listener also gates).
+  if (message.bot_id || event.bot_id || !message.user) return;
+  const channelId = event.channel;
+  const originalTs = message.ts;
+  if (!channelId || !originalTs) return;
+
+  // Dedup redelivered edit events by (original ts, edit ts).
+  const dedupId = `${originalTs}:edited:${message.edited?.ts || ''}`;
+  if (seenBefore(dedupId)) {
+    logger.info(`[consensus] dedup: skipping already-processed edit ${dedupId}`);
+    return;
+  }
+
+  await runQueued(channelId, () => runEditPipeline({ event, client, logger }));
+}
+
+/**
+ * Serialized body of the edit-sync pipeline for one message.
+ * @param {{
+ *   event: any,
+ *   client: import('@slack/web-api').WebClient,
+ *   logger: import('@slack/bolt').Logger
+ * }} args
+ * @returns {Promise<void>}
+ */
+async function runEditPipeline({ event, client, logger }) {
+  const channelId = event.channel;
+  const message = event.message || {};
+  const originalTs = message.ts;
+  const newText = message.text || '';
+  const threadTs = message.thread_ts || originalTs;
+  const startedAt = Date.now();
+
+  try {
+    // No captures from this message → nothing to reconcile. Cheapest exit, no LLM.
+    const prior = listDecisionsByMessage(channelId, originalTs);
+    if (prior.length === 0) return;
+
+    // A non-textual edit (e.g. Slack attaching a link unfurl) leaves the text
+    // unchanged — reclassifying would waste an LLM call and change nothing.
+    const prevText = event.previous_message?.text;
+    if (typeof prevText === 'string' && prevText === newText) return;
+
+    // Re-classify the NEW text with the same stripping + question guard the
+    // capture path uses. If the edit stripped out all decision content, the
+    // classifier returns nothing and every prior capture is retired.
+    /** @type {Array<{statement: string, rationale: string|null, confidence: number}>} */
+    let classifications = [];
+    const stripped = meaningfulText(newText);
+    if (stripped.length >= MIN_LENGTH) {
+      const clsStart = Date.now();
+      classifications = await classifyDecisions(newText);
+      logger.info(
+        `[consensus] edit re-classify took ${Date.now() - clsStart}ms → ${classifications.length} candidate(s)`,
+      );
+    }
+    const isQuestion = looksLikeQuestion(newText);
+    const toCapture = isQuestion
+      ? []
+      : classifications.filter((c) => c.confidence >= DECISION_MIN_CONFIDENCE).slice(0, MAX_CAPTURES_PER_MESSAGE);
+
+    // Reconcile by normalized statement.
+    const { retired, added } = diffStatements(
+      prior.map((d) => d.statement),
+      toCapture.map((c) => c.statement),
+    );
+    const retiredKeys = new Set(retired.map(normStatement));
+    const addedKeys = new Set(added.map(normStatement));
+    const toRetire = prior.filter((d) => retiredKeys.has(normStatement(d.statement)));
+    const toAdd = toCapture.filter((c) => addedKeys.has(normStatement(c.statement)));
+
+    // Retire decisions whose statements no longer appear in the edited message.
+    for (const d of toRetire) {
+      retireDecision(d.id, `source message edited (${message.edited?.ts || ''})`);
+      recordEvent('edited_sync', d.id);
+    }
+
+    // Add newly-introduced decisions (same caps/sanitization as capture) and
+    // post a capture card in-thread for each.
+    if (toAdd.length > 0) {
+      const [permalink, channelInfo] = await Promise.all([
+        fetchPermalink(client, channelId, originalTs),
+        fetchChannelInfo(client, channelId),
+      ]);
+      if (channelInfo.isPrivate === null) {
+        logger.info('[consensus] channel privacy unknown — treating as private (fail-closed)');
+      }
+      const isPrivate = channelInfo.isPrivate === false ? 0 : 1;
+
+      for (const c of toAdd) {
+        const decision = addDecision({
+          statement: (c.statement || newText.slice(0, 280)).slice(0, 500),
+          rationale: c.rationale,
+          channel_id: channelId,
+          channel_name: channelInfo.name,
+          decided_by: message.user,
+          message_ts: originalTs,
+          permalink,
+          confidence: c.confidence,
+          is_private: isPrivate,
+        });
+        recordEvent('captured', decision.id);
+        try {
+          await client.chat.postMessage({
+            channel: channelId,
+            thread_ts: threadTs,
+            text: `📌 Decision captured: ${decision.statement}`,
+            blocks: decisionCard({
+              statement: decision.statement,
+              decidedBy: decision.decided_by,
+              channelName: decision.channel_name,
+              permalink: decision.permalink,
+              id: decision.id,
+            }),
+          });
+        } catch (e) {
+          logger.error(`[consensus] failed to post edit-added decision card: ${e}`);
+        }
+      }
+    }
+
+    // One compact thread note, only when something actually changed.
+    if (toRetire.length + toAdd.length > 0) {
+      const keptCount = prior.length - toRetire.length;
+      try {
+        await client.chat.postMessage({
+          channel: channelId,
+          thread_ts: originalTs,
+          text: `✏️ Message edited — ledger synced: ${keptCount} kept, ${toRetire.length} retired, ${toAdd.length} added.`,
+        });
+      } catch (e) {
+        logger.error(`[consensus] failed to post edit-sync note: ${e}`);
+      }
+    }
+
+    logger.info(
+      `[consensus] handleMessageEdited total ${Date.now() - startedAt}ms → ${prior.length - toRetire.length} kept, ${toRetire.length} retired, ${toAdd.length} added`,
+    );
+  } catch (e) {
+    logger.error(`[consensus] edit-sync error (non-fatal): ${e}`);
+  }
+}
+
+/**
+ * Handle a delete (`message_deleted`) of a channel message: retire every
+ * decision that was captured from it. Silent — the source message is gone, so
+ * there is nothing to post and no LLM to call. Serialized behind the per-channel
+ * queue so it can't race a concurrent capture/edit for the same channel.
+ * @param {{
+ *   event: any,
+ *   logger: import('@slack/bolt').Logger
+ * }} args
+ * @returns {Promise<void>}
+ */
+export async function handleMessageDeleted({ event, logger }) {
+  const channelId = event.channel;
+  const deletedTs = event.deleted_ts;
+  if (!channelId || !deletedTs) return;
+
+  // Dedup redelivered delete events.
+  const dedupId = `${deletedTs}:deleted`;
+  if (seenBefore(dedupId)) {
+    logger.info(`[consensus] dedup: skipping already-processed delete ${dedupId}`);
+    return;
+  }
+
+  await runQueued(channelId, async () => {
+    try {
+      const prior = listDecisionsByMessage(channelId, deletedTs);
+      if (prior.length === 0) return;
+      for (const d of prior) {
+        retireDecision(d.id, 'source message deleted');
+        recordEvent('deleted_sync', d.id);
+      }
+      logger.info(`[consensus] source deleted — retired ${prior.length} decision(s)`);
+    } catch (e) {
+      logger.error(`[consensus] delete-sync error (non-fatal): ${e}`);
+    }
+  });
 }
