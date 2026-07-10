@@ -36,11 +36,14 @@ jobs:
             consensus.db
             consensus.db-wal
             consensus.db-shm
-          key: consensus-ledger-${{ github.run_id }}
+          key: consensus-ledger-v2-${{ github.run_id }}
           restore-keys: |
-            consensus-ledger-
+            consensus-ledger-v2-
 
       - run: npm ci
+
+      - name: Seed ledger on fresh runner
+        run: node scripts/seed-ledger.mjs
 
       - name: Run agent (Socket Mode)
         env:
@@ -62,4 +65,4 @@ jobs:
             consensus.db
             consensus.db-wal
             consensus.db-shm
-          key: consensus-ledger-${{ github.run_id }}
+          key: consensus-ledger-v2-${{ github.run_id }}
