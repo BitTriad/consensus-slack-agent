@@ -62,39 +62,38 @@ Receipts committed for every stack — hosted [`EVAL-RESULTS-hosted.txt`](consen
 
 ```mermaid
 flowchart TD
-    evt([Slack message event])
+    evt(["Slack message event"])
 
-    subgraph ambient [Ambient pipeline]
-        pre[Pre-filter<br/>dedup · length · keywords · rate guard]
-        clf[Decision classifier · LLM]
-        con[Contradiction engine]
-        judge[Scope-aware judge · LLM]
-        gate{Permission gate<br/>fail-closed · membership check}
+    subgraph ambient ["Ambient pipeline"]
+        pre["Pre-filter<br/>dedup, length, keywords, rate guard"]
+        clf["Decision classifier - LLM"]
+        con["Contradiction engine"]
+        judge["Scope-aware judge - LLM"]
+        gate{"Permission gate<br/>fail-closed membership check"}
     end
 
-    ledger[(Decision Ledger · SQLite)]
+    ledger[("Decision Ledger - SQLite")]
 
-    subgraph surfaces [Surfaces]
-        alert[Ephemeral alert<br/>full or REDACTED]
-        home[App Home dashboard]
+    subgraph surfaces ["Surfaces"]
+        alert["Ephemeral alert<br/>full or REDACTED"]
+        home["App Home dashboard"]
     end
 
-    audit[Consistency audit<br/>scan LLM → judge verify]
-    edits([Edits / deletes])
+    audit["Consistency audit<br/>scan LLM then judge verify"]
+    edits(["Edits / deletes"])
 
     evt --> pre
-    pre --> clf --> ledger
-    pre --> con --> judge --> gate --> alert
-    ledger -. candidates .-> judge
+    pre --> clf
+    clf --> ledger
+    pre --> con
+    con --> judge
+    judge --> gate
+    gate --> alert
+    ledger -. "candidates" .-> judge
     ledger --> home
     ledger --> audit
-    audit -. two-stage verify .-> judge
-    edits -- re-sync --> ledger
-
-    classDef store stroke-width:2px,stroke-dasharray:0;
-    classDef llm stroke-width:2px;
-    class ledger store;
-    class clf,judge,audit llm;
+    audit -. "two-stage verify" .-> judge
+    edits -- "re-sync" --> ledger
 ```
 
 <details>
