@@ -12,6 +12,7 @@
  */
 
 import { contradictionAlert, decisionCard } from './blocks.js';
+import { captureStatusForChannel, isEnforceable } from './governance.js';
 import { classifyDecisions, judgeContradiction } from './judge.js';
 import {
   addDecision,
@@ -24,6 +25,33 @@ import {
 } from './ledger.js';
 import { canSeeDecision } from './permissions.js';
 import { searchContext } from './rts.js';
+
+/**
+ * Enforceable candidate statuses — the ledger rows worth handing to the
+ * contradiction judge. Both are enforcing (see governance.isEnforceable); an
+ * additional per-row {@link isEnforceable} filter then drops any that have
+ * passed their expires_at. `proposed`, `exception`, `superseded`, `expired`, and
+ * `rejected` are intentionally excluded here.
+ * @type {string[]}
+ */
+const ENFORCEABLE_STATUSES = ['active', 'confirmed'];
+
+/**
+ * Cheap, pure "until &lt;date&gt;" expiry parser for the capture path — extracts an
+ * ISO calendar date (YYYY-MM-DD) that trails an "until"/"through"/"expires"
+ * keyword and returns it as an end-of-day ISO timestamp. Deliberately narrow: no
+ * natural-language month parsing, NO LLM call. Returns null when nothing trivial
+ * matches. Exported for unit testing.
+ * @param {string} text
+ * @returns {string | null}
+ */
+export function parseUntilDate(text) {
+  const m = /\b(?:until|through|thru|expires?(?:\s+on)?|valid\s+until)\s+(\d{4}-\d{2}-\d{2})\b/i.exec(text || '');
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T23:59:59.999Z`);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toISOString();
+}
 
 // Minimum message length worth spending any thought on.
 const MIN_LENGTH = 20;
@@ -541,7 +569,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // over the limit, skip the message entirely (capture AND contradiction) —
     // never crash. A cheap limit-1 ledger read tells us whether the judge path
     // would fire without paying for the full candidate query.
-    const willUseLlm = decisionAdjacent || listDecisions({ status: 'active', limit: 1 }).length > 0;
+    const willUseLlm = decisionAdjacent || listDecisions({ status: ENFORCEABLE_STATUSES, limit: 1 }).length > 0;
     if (willUseLlm && !allowLlmRun(event.user || 'unknown')) {
       logger.info(`[consensus] rate guard: skipping LLM work for message from ${event.user || 'unknown'}`);
       return;
@@ -599,6 +627,14 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
       }
       const isPrivate = channelInfo.isPrivate === false ? 0 : 1;
 
+      // Governance gate: captures in a trusted channel become enforceable
+      // ('active') immediately; captures anywhere else become 'proposed' (stored
+      // and shown, but never hard-alerted until an authority confirms them).
+      const captureStatus = captureStatusForChannel(channelId);
+      // Best-effort, cheap expiry: an "until <ISO date>" in the message sets
+      // expires_at. No LLM call; null when nothing trivial matches.
+      const expiresAt = parseUntilDate(text);
+
       for (const c of capped) {
         const decision = addDecision({
           // Cap the captured statement so an over-long (or padded) classification
@@ -612,6 +648,9 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
           permalink,
           confidence: c.confidence,
           is_private: isPrivate,
+          status: captureStatus,
+          owner_user_id: event.user,
+          expires_at: expiresAt,
         });
         capturedIds.push(decision.id);
         recordEvent('captured', decision.id);
@@ -629,6 +668,9 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
               channelName: decision.channel_name,
               permalink: decision.permalink,
               id: decision.id,
+              status: decision.status,
+              ownerUserId: decision.owner_user_id,
+              expiresAt: decision.expires_at,
             }),
           });
         } catch (e) {
@@ -645,9 +687,14 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // OTHER threads (never flag a message against its own thread's decision,
     // including the one we may have just captured above). Cap at the most
     // recent MAX_CANDIDATES to bound judge cost.
-    const candidates = listDecisions({ status: 'active', limit: MAX_CANDIDATES })
+    // Only genuinely enforceable decisions (active/confirmed AND not past their
+    // expires_at) are contradiction candidates. proposed/exception/superseded/
+    // expired/rejected rows are never hard-alerted, so they never reach the judge.
+    const now = Date.now();
+    const candidates = listDecisions({ status: ENFORCEABLE_STATUSES, limit: MAX_CANDIDATES })
       .filter(
         (d) =>
+          isEnforceable(d, now) &&
           !capturedIds.includes(d.id) &&
           d.message_ts !== threadTs &&
           (d.channel_id !== channelId || d.message_ts !== messageTs),
@@ -842,6 +889,9 @@ async function runEditPipeline({ event, client, logger }) {
         logger.info('[consensus] channel privacy unknown — treating as private (fail-closed)');
       }
       const isPrivate = channelInfo.isPrivate === false ? 0 : 1;
+      // Same governance gate as fresh capture (see runPipeline).
+      const captureStatus = captureStatusForChannel(channelId);
+      const expiresAt = parseUntilDate(newText);
 
       for (const c of cappedAdd) {
         const decision = addDecision({
@@ -854,6 +904,9 @@ async function runEditPipeline({ event, client, logger }) {
           permalink,
           confidence: c.confidence,
           is_private: isPrivate,
+          status: captureStatus,
+          owner_user_id: message.user,
+          expires_at: expiresAt,
         });
         recordEvent('captured', decision.id);
         try {
@@ -867,6 +920,9 @@ async function runEditPipeline({ event, client, logger }) {
               channelName: decision.channel_name,
               permalink: decision.permalink,
               id: decision.id,
+              status: decision.status,
+              ownerUserId: decision.owner_user_id,
+              expiresAt: decision.expires_at,
             }),
           });
         } catch (e) {

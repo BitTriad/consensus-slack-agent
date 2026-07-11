@@ -26,8 +26,9 @@ for (const r of rows) {
     confidence: r.confidence ?? 0.9,
     is_private: r.is_private ? 1 : 0,
   });
+  // Map both the legacy ('dismissed') and new ('rejected') seed vocab.
   if (r.status === 'superseded') supersede(d.id, null);
-  else if (r.status === 'dismissed') dismissDecision(d.id);
+  else if (r.status === 'dismissed' || r.status === 'rejected') dismissDecision(d.id);
   added++;
 }
 console.log(`[seed] seeded ${added} decisions`);

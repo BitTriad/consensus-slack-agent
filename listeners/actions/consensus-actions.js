@@ -4,6 +4,8 @@ import {
   runAuditForViewer,
   tryAcquireAudit,
 } from '../../consensus-core/audit-report.js';
+import { decisionCard } from '../../consensus-core/blocks.js';
+import { canConfirm, isEnforceable } from '../../consensus-core/governance.js';
 import {
   dismissDecision,
   getDecision,
@@ -11,6 +13,7 @@ import {
   recordAuditDismissal,
   recordDismissal,
   recordEvent,
+  setDecisionStatus,
   supersede,
 } from '../../consensus-core/ledger.js';
 
@@ -105,31 +108,161 @@ export async function handleReasoning({ ack, body, respond, logger }) {
 }
 
 /**
+ * The ephemeral refusal shown when a non-authorized user clicks a lifecycle
+ * action (Confirm / Reject / Mark-exception / Supersede) on a decision card.
+ * @param {import('@slack/bolt').RespondFn} respond
+ * @returns {Promise<void>}
+ */
+async function refuseUnauthorized(respond) {
+  await respond({
+    replace_original: false,
+    response_type: 'ephemeral',
+    text: '🔒 Only an authorized decision owner/admin can confirm this.',
+  });
+}
+
+/**
+ * Re-render a decision card in place after a lifecycle transition so its badge
+ * and buttons reflect the new status.
+ * @param {import('@slack/bolt').RespondFn} respond
+ * @param {import('../../consensus-core/ledger.js').Decision} decision
+ * @param {string} noticeText fallback/plain text summary of the transition
+ * @returns {Promise<void>}
+ */
+async function replaceWithCard(respond, decision, noticeText) {
+  await respond({
+    replace_original: true,
+    text: noticeText,
+    blocks: decisionCard({
+      statement: decision.statement,
+      decidedBy: decision.decided_by,
+      channelName: decision.channel_name,
+      permalink: decision.permalink,
+      id: decision.id,
+      status: decision.status,
+      ownerUserId: decision.owner_user_id,
+      expiresAt: decision.expires_at,
+    }),
+  });
+}
+
+/**
  * "Mark superseded" on a decision-capture card → supersede + edit the card.
+ * Authority-gated: only an authorized owner/admin may transition the decision.
  * @param {import('@slack/bolt').SlackActionMiddlewareArgs & import('@slack/bolt').AllMiddlewareArgs} args
  * @returns {Promise<void>}
  */
 export async function handleCardSupersede({ ack, body, respond, logger }) {
   await ack();
   try {
+    const userId = /** @type {any} */ (body).user?.id ?? null;
+    if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
     const id = actionValue(body);
-    const decision = id ? getDecision(id) : null;
-    if (id) supersede(id, null);
+    if (!id) return;
+    supersede(id, null);
+    recordEvent('superseded', id);
+    const decision = getDecision(id);
+    if (decision) {
+      await replaceWithCard(respond, decision, `🔁 Decision marked *superseded*: ${decision.statement}`);
+    } else {
+      await respond({ replace_original: true, text: '🔁 Decision marked *superseded*.' });
+    }
+  } catch (e) {
+    logger.error(`[consensus] handleCardSupersede failed: ${e}`);
+  }
+}
+
+/**
+ * "Confirm" on a proposed decision card → promote it to an enforceable
+ * `confirmed` (authority-approved) decision. Authority-gated.
+ * @param {import('@slack/bolt').SlackActionMiddlewareArgs & import('@slack/bolt').AllMiddlewareArgs} args
+ * @returns {Promise<void>}
+ */
+export async function handleConfirm({ ack, body, respond, logger }) {
+  await ack();
+  try {
+    const userId = /** @type {any} */ (body).user?.id ?? null;
+    if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
+    const id = actionValue(body);
+    if (!id) return;
+    setDecisionStatus(id, 'confirmed');
+    recordEvent('confirmed', id);
+    const decision = getDecision(id);
+    if (decision) {
+      await replaceWithCard(respond, decision, `✅ Decision *confirmed*: ${decision.statement}`);
+    } else {
+      await respond({ replace_original: true, text: '✅ Decision *confirmed*.' });
+    }
+  } catch (e) {
+    logger.error(`[consensus] handleConfirm failed: ${e}`);
+  }
+}
+
+/**
+ * "Reject" on a decision card → mark it `rejected` (never enforced). Authority-gated.
+ * @param {import('@slack/bolt').SlackActionMiddlewareArgs & import('@slack/bolt').AllMiddlewareArgs} args
+ * @returns {Promise<void>}
+ */
+export async function handleReject({ ack, body, respond, logger }) {
+  await ack();
+  try {
+    const userId = /** @type {any} */ (body).user?.id ?? null;
+    if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
+    const id = actionValue(body);
+    if (!id) return;
+    setDecisionStatus(id, 'rejected');
+    recordEvent('rejected', id);
     await respond({
       replace_original: true,
-      text: `🔁 Decision marked *superseded*${decision ? `: ${decision.statement}` : ''}.`,
+      text: '🚫 Rejected — I won’t track this as a team decision.',
       blocks: [
         {
           type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `🔁 *Superseded*${decision ? ` — ~${decision.statement}~` : ''}\nI’ll no longer treat this as the active decision.`,
-          },
+          text: { type: 'mrkdwn', text: '🚫 *Rejected* — I won’t enforce this as a team decision.' },
         },
       ],
     });
   } catch (e) {
-    logger.error(`[consensus] handleCardSupersede failed: ${e}`);
+    logger.error(`[consensus] handleReject failed: ${e}`);
+  }
+}
+
+/**
+ * "Mark exception" on a decision card → mark it `exception` (a carve-out that is
+ * NOT globally enforced). Authority-gated.
+ *
+ * Phase-1 SEMANTICS (self-exception): this transitions the SAME decision to
+ * status `exception`, leaving `exception_of` null. The meaning is "this standing
+ * item is actually a carve-out — don't enforce it globally". Because `exception`
+ * is excluded from ENFORCEABLE_STATUSES (see governance.isEnforceable), the row
+ * immediately stops being an alert/audit candidate. No new row is created.
+ *
+ * PHASE-2 TODO: model an exception as a SEPARATE entry that references a distinct
+ * parent policy via the `exception_of` column (already migrated on both backends)
+ * and narrows it via an `applies_to` scope note — see governance.narrowsScope for
+ * the intended predicate. That richer "exception references a distinct parent"
+ * model is intentionally NOT built here; this handler only does the tractable
+ * self-exception so nothing is over-claimed.
+ * @param {import('@slack/bolt').SlackActionMiddlewareArgs & import('@slack/bolt').AllMiddlewareArgs} args
+ * @returns {Promise<void>}
+ */
+export async function handleMarkException({ ack, body, respond, logger }) {
+  await ack();
+  try {
+    const userId = /** @type {any} */ (body).user?.id ?? null;
+    if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
+    const id = actionValue(body);
+    if (!id) return;
+    setDecisionStatus(id, 'exception');
+    recordEvent('exception', id);
+    const decision = getDecision(id);
+    if (decision) {
+      await replaceWithCard(respond, decision, `⚖️ Marked as *exception*: ${decision.statement}`);
+    } else {
+      await respond({ replace_original: true, text: '⚖️ Marked as an *exception*.' });
+    }
+  } catch (e) {
+    logger.error(`[consensus] handleMarkException failed: ${e}`);
   }
 }
 
@@ -157,7 +290,10 @@ export async function handleRunAudit({ ack, body, client, logger }) {
       return;
     }
     try {
-      const activeCount = listDecisions({ status: 'active', limit: 60 }).length;
+      const now = Date.now();
+      const activeCount = listDecisions({ status: ['active', 'confirmed'], limit: 60 }).filter((d) =>
+        isEnforceable(d, now),
+      ).length;
       await client.chat.postMessage({
         channel: userId,
         text: `🔎 Auditing ${activeCount} active decision${activeCount === 1 ? '' : 's'} for latent conflicts…`,

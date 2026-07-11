@@ -6,6 +6,7 @@ import {
   checkRateWindow,
   isQueueFull,
   looksLikeQuestion,
+  parseUntilDate,
   pruneAlerted,
 } from '../../consensus-core/pipeline.js';
 
@@ -24,6 +25,20 @@ describe('looksLikeQuestion', () => {
 
   it('is not a question when there is no interrogative prefix and no "?"', () => {
     assert.strictEqual(looksLikeQuestion('We decided to standardize on Postgres.'), false);
+  });
+});
+
+describe('parseUntilDate (cheap capture-path expiry)', () => {
+  it('extracts an ISO date trailing an until/through/expires keyword', () => {
+    assert.strictEqual(parseUntilDate('Hiring is frozen until 2026-09-30.'), '2026-09-30T23:59:59.999Z');
+    assert.strictEqual(parseUntilDate('Discount valid through 2026-12-31'), '2026-12-31T23:59:59.999Z');
+    assert.strictEqual(parseUntilDate('This policy expires on 2027-01-15'), '2027-01-15T23:59:59.999Z');
+  });
+
+  it('returns null when there is no trivial "until <ISO date>" (no LLM guessing)', () => {
+    assert.strictEqual(parseUntilDate('We are standardizing on Postgres.'), null);
+    assert.strictEqual(parseUntilDate('Freeze hiring until the end of the quarter.'), null);
+    assert.strictEqual(parseUntilDate(''), null);
   });
 });
 

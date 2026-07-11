@@ -9,6 +9,7 @@
 
 import { runAudit, setLastAudit } from './audit.js';
 import { auditConflictBlocks } from './blocks.js';
+import { isEnforceable } from './governance.js';
 import { listDecisions, recordEvent } from './ledger.js';
 import { canSeeDecision } from './permissions.js';
 
@@ -93,7 +94,11 @@ export function _resetAuditMeter() {
  * @returns {Promise<AuditReport>}
  */
 export async function runAuditForViewer({ client, userId, logger }, { publicOnly = false } = {}) {
-  const decisions = listDecisions({ status: 'active', limit: 60 });
+  // Only enforceable decisions (active/confirmed AND not past their expires_at)
+  // are audited for latent conflicts — proposed/exception/superseded/expired/
+  // rejected rows are never enforced, so a conflict among them is not actionable.
+  const now = Date.now();
+  const decisions = listDecisions({ status: ['active', 'confirmed'], limit: 60 }).filter((d) => isEnforceable(d, now));
   const result = await runAudit({ decisions });
   recordEvent('audit_run');
 

@@ -15,10 +15,19 @@
  * @property {string|null} decided_by
  * @property {string|null} message_ts
  * @property {string|null} permalink
- * @property {'active'|'superseded'|'dismissed'} status
+ * @property {'proposed'|'confirmed'|'active'|'exception'|'superseded'|'expired'|'rejected'} status
  * @property {number} confidence
  * @property {string} created_at
  * @property {number} is_private
+ * @property {string|null} team_label
+ * @property {string|null} applies_to
+ * @property {string|null} expires_at ISO-8601; when set and in the past the decision is treated as expired.
+ * @property {string|null} owner_user_id
+ * @property {string|null} authority_level e.g. 'policy' | 'project' | 'preference'
+ * @property {string|null} exception_of id of the parent decision this row carves an
+ *   exception out of. Null for a self-exception (a standing item annotated as a
+ *   non-enforced carve-out) and for every non-exception row. See governance.narrowsScope
+ *   for the intended Phase-2 parent-linked semantics.
  *
  * @typedef {Object} Stats
  * @property {number} active
@@ -31,15 +40,16 @@
  * @property {number} learnedPatterns
  * @property {number|null} precisionPct
  *
- * @typedef {'alert_fired'|'dismissed'|'capture_dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'} EventKind
+ * @typedef {'alert_fired'|'dismissed'|'capture_dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'|'confirmed'|'rejected'|'exception'} EventKind
  *
  * @typedef {Object} LedgerBackend
  * @property {(d: Partial<Decision> & {id: string, statement: string, channel_id: string}) => Decision} addDecision
- * @property {(opts?: {status?: string, limit?: number}) => Decision[]} listDecisions
+ * @property {(opts?: {status?: string | string[], limit?: number}) => Decision[]} listDecisions
  * @property {(channelId: string, messageTs: string) => Decision[]} listDecisionsByMessage
  * @property {(id: string) => Decision | null} getDecision
  * @property {(id: string, byId: string | null) => void} supersede
  * @property {(id: string) => void} dismiss
+ * @property {(id: string, status: Decision['status']) => void} setStatus
  * @property {(newMessageText: string, matchedDecisionId: string, userId: string | null) => void} recordDismissal
  * @property {(newMessageText: string, decisionId: string, userId: string | null) => boolean} isKnownFalsePositive
  * @property {(aId: string, bId: string) => void} recordAuditDismissal
@@ -51,6 +61,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { mapLegacyStatus } from './governance.js';
 
 const require = createRequire(import.meta.url);
 
@@ -94,12 +105,14 @@ export function auditPairKey(aId, bId) {
 }
 
 /**
- * Build the SQLite-backed ledger.
+ * Build the SQLite-backed ledger. `dbPath` is injectable so tests can build a
+ * backend on a temp file; production uses the module default.
  * @param {new (path: string) => any} DatabaseSync
+ * @param {string} [dbPath]
  * @returns {LedgerBackend}
  */
-function createSqliteBackend(DatabaseSync) {
-  const db = new DatabaseSync(DB_PATH);
+export function createSqliteBackend(DatabaseSync, dbPath = DB_PATH) {
+  const db = new DatabaseSync(dbPath);
   // Tolerate concurrent access (e.g. parallel test processes, or the OAuth app
   // and Socket-mode app sharing the file): WAL lets readers and one writer
   // coexist, and busy_timeout makes a contended writer wait instead of failing
@@ -121,7 +134,13 @@ function createSqliteBackend(DatabaseSync) {
       permalink TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       confidence REAL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      team_label TEXT,
+      applies_to TEXT,
+      expires_at TEXT,
+      owner_user_id TEXT,
+      authority_level TEXT,
+      exception_of TEXT
     );
     CREATE TABLE IF NOT EXISTS dismissals (
       id TEXT PRIMARY KEY,
@@ -151,6 +170,32 @@ function createSqliteBackend(DatabaseSync) {
     }
   } catch {
     // If the pragma/alter fails, callers still work (is_private read defaults to 0).
+  }
+
+  // Idempotent migration: add the Phase-1 governance/scope columns if an older
+  // DB predates them. Same PRAGMA-check pattern as is_private above — node:sqlite
+  // has no "ADD COLUMN IF NOT EXISTS". All are nullable with no default, so a
+  // legacy row simply reads back null for each.
+  try {
+    const cols = /** @type {{name: string}[]} */ (db.prepare('PRAGMA table_info(decisions)').all());
+    const have = new Set(cols.map((c) => c.name));
+    for (const col of ['team_label', 'applies_to', 'expires_at', 'owner_user_id', 'authority_level', 'exception_of']) {
+      if (!have.has(col)) db.exec(`ALTER TABLE decisions ADD COLUMN ${col} TEXT`);
+    }
+  } catch {
+    // If the pragma/alter fails, callers still work (new fields read as null).
+  }
+
+  // Idempotent migration: remap the legacy status vocabulary to the Phase-1
+  // lifecycle states. Only `dismissed` was renamed (→ `rejected`); `active` and
+  // `superseded` keep their meaning. This is a data UPDATE (not a schema change),
+  // and it is naturally idempotent — after it runs there are no `dismissed` rows
+  // left, so a second run touches nothing.
+  try {
+    db.exec("UPDATE decisions SET status = 'rejected' WHERE status = 'dismissed'");
+  } catch {
+    // Best-effort; a failed remap leaves legacy rows readable (mapped on read is
+    // not done for SQLite, but the demo/seed never writes 'dismissed' anymore).
   }
 
   // Idempotent migration: add user_id to dismissals if an older DB predates
@@ -188,9 +233,9 @@ function createSqliteBackend(DatabaseSync) {
   // than a thrown unique-constraint error; addDecision then returns the existing row.
   const insertDecision = db.prepare(`
     INSERT OR IGNORE INTO decisions
-      (id, statement, rationale, channel_id, channel_name, decided_by, message_ts, permalink, status, confidence, created_at, is_private)
+      (id, statement, rationale, channel_id, channel_name, decided_by, message_ts, permalink, status, confidence, created_at, is_private, team_label, applies_to, expires_at, owner_user_id, authority_level, exception_of)
     VALUES
-      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const selectById = db.prepare('SELECT * FROM decisions WHERE id = ?');
   const selectByMsg = db.prepare('SELECT * FROM decisions WHERE channel_id = ? AND message_ts = ? AND statement = ?');
@@ -198,7 +243,7 @@ function createSqliteBackend(DatabaseSync) {
     'SELECT * FROM decisions WHERE channel_id = ? AND message_ts = ? ORDER BY created_at DESC',
   );
   const supersedeStmt = db.prepare("UPDATE decisions SET status = 'superseded' WHERE id = ?");
-  const dismissStmt = db.prepare("UPDATE decisions SET status = 'dismissed' WHERE id = ?");
+  const setStatusStmt = db.prepare('UPDATE decisions SET status = ? WHERE id = ?');
   const insertDismissal = db.prepare(
     'INSERT INTO dismissals (id, new_message_text, matched_decision_id, user_id, dismissed_at) VALUES (?, ?, ?, ?, ?)',
   );
@@ -231,6 +276,12 @@ function createSqliteBackend(DatabaseSync) {
         confidence: typeof d.confidence === 'number' ? d.confidence : 0,
         created_at: d.created_at ?? new Date().toISOString(),
         is_private: d.is_private ? 1 : 0,
+        team_label: d.team_label ?? null,
+        applies_to: d.applies_to ?? null,
+        expires_at: d.expires_at ?? null,
+        owner_user_id: d.owner_user_id ?? null,
+        authority_level: d.authority_level ?? null,
+        exception_of: d.exception_of ?? null,
       };
       const info = insertDecision.run(
         row.id,
@@ -245,6 +296,12 @@ function createSqliteBackend(DatabaseSync) {
         row.confidence,
         row.created_at,
         row.is_private,
+        row.team_label,
+        row.applies_to,
+        row.expires_at,
+        row.owner_user_id,
+        row.authority_level,
+        row.exception_of,
       );
       // Ignored insert → a row for this (channel_id, message_ts) already exists
       // (redelivery). Return that existing row instead of a phantom new one.
@@ -260,9 +317,10 @@ function createSqliteBackend(DatabaseSync) {
       let sql = 'SELECT * FROM decisions';
       /** @type {any[]} */
       const params = [];
-      if (status) {
-        sql += ' WHERE status = ?';
-        params.push(status);
+      const statuses = Array.isArray(status) ? status : status ? [status] : [];
+      if (statuses.length > 0) {
+        sql += ` WHERE status IN (${statuses.map(() => '?').join(', ')})`;
+        params.push(...statuses);
       }
       sql += ' ORDER BY created_at DESC LIMIT ?';
       params.push(limit);
@@ -284,7 +342,12 @@ function createSqliteBackend(DatabaseSync) {
     },
     /** @param {string} id */
     dismiss(id) {
-      dismissStmt.run(id);
+      // A rejected capture is status 'rejected' in the Phase-1 vocabulary.
+      setStatusStmt.run('rejected', id);
+    },
+    /** @param {string} id @param {Decision['status']} status */
+    setStatus(id, status) {
+      setStatusStmt.run(status, id);
     },
     recordDismissal(newMessageText, matchedDecisionId, userId) {
       insertDismissal.run(randomUUID(), newMessageText, matchedDecisionId, userId ?? null, new Date().toISOString());
@@ -322,7 +385,9 @@ function createSqliteBackend(DatabaseSync) {
       );
       const byKind = Object.fromEntries(eventCounts.map((c) => [c.kind, c.n]));
       return computeStats({
-        active: byStatus.active ?? 0,
+        // `confirmed` and `active` are both enforceable — count them together as
+        // the "active decisions" surfaced on the dashboard.
+        active: (byStatus.active ?? 0) + (byStatus.confirmed ?? 0),
         superseded: byStatus.superseded ?? 0,
         captured: totalDecisions,
         learnedPatterns,
@@ -364,19 +429,36 @@ export function computeStats(raw) {
 }
 
 /**
- * Build the JSON-file fallback backend with an identical interface.
+ * Build the JSON-file fallback backend with an identical interface. `jsonPath`
+ * is injectable so tests can build a backend on a temp file; production uses the
+ * module default.
+ * @param {string} [jsonPath]
  * @returns {LedgerBackend}
  */
-function createJsonBackend() {
+export function createJsonBackend(jsonPath = JSON_PATH) {
   // Lazy require to avoid top-level fs when sqlite is available.
   const fs = require('node:fs');
 
   /** @returns {{decisions: Decision[], dismissals: {id: string, new_message_text: string, matched_decision_id: string, user_id?: string|null, dismissed_at: string}[], events: {id: string, kind: string, decision_id: string|null, created_at: string}[], auditDismissals: {pair_key: string, created_at: string}[]}} */
   function load() {
     try {
-      const data = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
+      const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
       if (!Array.isArray(data.events)) data.events = [];
       if (!Array.isArray(data.auditDismissals)) data.auditDismissals = [];
+      // Migrate-on-load parity with SQLite: remap the legacy status vocabulary
+      // (dismissed→rejected) and backfill the nullable governance/scope fields so
+      // callers see a uniform Decision shape regardless of when a row was written.
+      if (Array.isArray(data.decisions)) {
+        for (const r of data.decisions) {
+          r.status = mapLegacyStatus(r.status);
+          if (r.team_label === undefined) r.team_label = null;
+          if (r.applies_to === undefined) r.applies_to = null;
+          if (r.expires_at === undefined) r.expires_at = null;
+          if (r.owner_user_id === undefined) r.owner_user_id = null;
+          if (r.authority_level === undefined) r.authority_level = null;
+          if (r.exception_of === undefined) r.exception_of = null;
+        }
+      }
       return data;
     } catch {
       return { decisions: [], dismissals: [], events: [], auditDismissals: [] };
@@ -384,7 +466,7 @@ function createJsonBackend() {
   }
   /** @param {ReturnType<typeof load>} data */
   function save(data) {
-    fs.writeFileSync(JSON_PATH, JSON.stringify(data, null, 2));
+    fs.writeFileSync(jsonPath, JSON.stringify(data, null, 2));
   }
 
   return {
@@ -412,6 +494,12 @@ function createJsonBackend() {
         confidence: typeof d.confidence === 'number' ? d.confidence : 0,
         created_at: d.created_at ?? new Date().toISOString(),
         is_private: d.is_private ? 1 : 0,
+        team_label: d.team_label ?? null,
+        applies_to: d.applies_to ?? null,
+        expires_at: d.expires_at ?? null,
+        owner_user_id: d.owner_user_id ?? null,
+        authority_level: d.authority_level ?? null,
+        exception_of: d.exception_of ?? null,
       };
       data.decisions.push(row);
       save(data);
@@ -420,7 +508,8 @@ function createJsonBackend() {
     listDecisions({ status, limit = 50 } = {}) {
       const data = load();
       let rows = data.decisions.slice();
-      if (status) rows = rows.filter((r) => r.status === status);
+      const statuses = Array.isArray(status) ? status : status ? [status] : [];
+      if (statuses.length > 0) rows = rows.filter((r) => statuses.includes(r.status));
       rows.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
       return rows.slice(0, limit);
     },
@@ -444,7 +533,14 @@ function createJsonBackend() {
     dismiss(id) {
       const data = load();
       const row = data.decisions.find((r) => r.id === id);
-      if (row) row.status = 'dismissed';
+      if (row) row.status = 'rejected';
+      save(data);
+    },
+    /** @param {string} id @param {Decision['status']} status */
+    setStatus(id, status) {
+      const data = load();
+      const row = data.decisions.find((r) => r.id === id);
+      if (row) row.status = status;
       save(data);
     },
     recordDismissal(newMessageText, matchedDecisionId, userId) {
@@ -496,7 +592,8 @@ function createJsonBackend() {
     },
     stats() {
       const data = load();
-      const active = data.decisions.filter((r) => r.status === 'active').length;
+      // `confirmed` and `active` are both enforceable — count them together.
+      const active = data.decisions.filter((r) => r.status === 'active' || r.status === 'confirmed').length;
       const superseded = data.decisions.filter((r) => r.status === 'superseded').length;
       const alertsFired = data.events.filter((e) => e.kind === 'alert_fired').length;
       const dismissed = data.events.filter((e) => e.kind === 'dismissed').length;
@@ -538,8 +635,9 @@ export function addDecision(d) {
 }
 
 /**
- * List decisions, newest first, optionally filtered by status.
- * @param {{status?: string, limit?: number}} [opts]
+ * List decisions, newest first, optionally filtered by status (a single status
+ * or an array of statuses matched with SQL `IN`).
+ * @param {{status?: string | string[], limit?: number}} [opts]
  * @returns {Decision[]}
  */
 export function listDecisions(opts = {}) {
@@ -591,12 +689,24 @@ export function supersede(id, byId = null) {
 }
 
 /**
- * Mark a captured row as not-a-decision (status 'dismissed').
+ * Mark a captured row as not-a-decision (status 'rejected').
  * @param {string} id
  * @returns {void}
  */
 export function dismissDecision(id) {
   backend.dismiss(id);
+}
+
+/**
+ * Transition a decision to an explicit lifecycle status (e.g. 'confirmed',
+ * 'rejected', 'exception'). Callers are responsible for the authority gate
+ * (see governance.canConfirm) — the ledger just records the state.
+ * @param {string} id
+ * @param {Decision['status']} status
+ * @returns {void}
+ */
+export function setDecisionStatus(id, status) {
+  backend.setStatus(id, status);
 }
 
 /**
@@ -671,7 +781,7 @@ export function isAuditPairDismissed(aId, bId) {
 
 /**
  * Record a learning-loop event
- * (alert_fired | dismissed | capture_dismissed | superseded | captured | audit_run | edited_sync | deleted_sync).
+ * (alert_fired | dismissed | capture_dismissed | superseded | captured | audit_run | edited_sync | deleted_sync | confirmed | rejected | exception).
  * @param {EventKind} kind
  * @param {string | null} [decisionId]
  * @returns {void}
