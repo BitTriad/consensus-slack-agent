@@ -29,6 +29,14 @@ const MAX_DECISIONS = 60;
 const STATEMENT_MAX = 300;
 
 /**
+ * Hard cap on candidate pairs returned from a single scan. Each surviving pair
+ * costs one (sometimes two) judge calls in Stage B, so this bounds verify cost
+ * and latency; excess pairs beyond the cap are dropped (the scan is high-recall,
+ * so the strongest-nominated pairs still get verified).
+ */
+const MAX_PAIRS = 15;
+
+/**
  * @typedef {import('./ledger.js').Decision} Decision
  */
 
@@ -134,7 +142,9 @@ export function extractJson(text) {
 /**
  * Normalize the scan LLM's parsed output into a clean, de-duplicated list of
  * candidate pairs whose ids both exist in `validIds`. Self-pairs and duplicate
- * (order-insensitive) pairs are dropped. Returns [] for any malformed shape.
+ * (order-insensitive) pairs are dropped. The result is capped at {@link MAX_PAIRS}
+ * to bound Stage-B verify cost; any pairs beyond the cap are dropped (and noted
+ * under AUDIT_DEBUG). Returns [] for any malformed shape.
  * @param {any} parsed
  * @param {Set<string>} validIds
  * @returns {{aId: string, bId: string, why: string}[]}
@@ -155,7 +165,12 @@ export function normalizeScanPairs(parsed, validIds) {
     seen.add(key);
     out.push({ aId, bId, why: typeof p.why === 'string' ? p.why.slice(0, 200) : '' });
   }
-  return out;
+  if (out.length > MAX_PAIRS && process.env.AUDIT_DEBUG) {
+    console.error(
+      `[audit] scan proposed ${out.length} pairs; capping to ${MAX_PAIRS} (dropped ${out.length - MAX_PAIRS})`,
+    );
+  }
+  return out.slice(0, MAX_PAIRS);
 }
 
 const SCAN_SYSTEM =

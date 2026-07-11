@@ -1,4 +1,9 @@
-import { composeAuditMessage, runAuditForViewer } from '../../consensus-core/audit-report.js';
+import {
+  composeAuditMessage,
+  releaseAudit,
+  runAuditForViewer,
+  tryAcquireAudit,
+} from '../../consensus-core/audit-report.js';
 import {
   dismissDecision,
   getDecision,
@@ -138,15 +143,28 @@ export async function handleRunAudit({ ack, body, client, logger }) {
   try {
     const userId = /** @type {any} */ (body).user?.id;
     if (!userId) return;
-    const activeCount = listDecisions({ status: 'active', limit: 60 }).length;
-    await client.chat.postMessage({
-      channel: userId,
-      text: `🔎 Auditing ${activeCount} active decision${activeCount === 1 ? '' : 's'} for latent conflicts…`,
-    });
+    // Metering: one audit at a time, with a cooldown between runs. The App Home
+    // DM path keeps its per-viewer permission behavior (no publicOnly).
+    if (!tryAcquireAudit()) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: '⏳ An audit just ran / is still running — try again in a minute.',
+      });
+      return;
+    }
+    try {
+      const activeCount = listDecisions({ status: 'active', limit: 60 }).length;
+      await client.chat.postMessage({
+        channel: userId,
+        text: `🔎 Auditing ${activeCount} active decision${activeCount === 1 ? '' : 's'} for latent conflicts…`,
+      });
 
-    const report = await runAuditForViewer({ client, userId, logger });
-    const message = composeAuditMessage(report);
-    await client.chat.postMessage({ channel: userId, ...message });
+      const report = await runAuditForViewer({ client, userId, logger });
+      const message = composeAuditMessage(report);
+      await client.chat.postMessage({ channel: userId, ...message });
+    } finally {
+      releaseAudit();
+    }
   } catch (e) {
     logger.error(`[consensus] handleRunAudit failed: ${e}`);
   }
@@ -217,10 +235,12 @@ export async function handleNotDecision({ ack, body, respond, logger }) {
   try {
     const id = actionValue(body);
     // Mark as genuinely dismissed (status 'dismissed' — 🚫 on the dashboard),
-    // removing it from active candidates, and record the learning event.
+    // removing it from active candidates, and record the learning event. Use the
+    // distinct 'capture_dismissed' kind (NOT 'dismissed', which counts alert
+    // dismissals) so rejecting a capture never pollutes the alert-precision stat.
     if (id) {
       dismissDecision(id);
-      recordEvent('dismissed', id);
+      recordEvent('capture_dismissed', id);
     }
     await respond({
       replace_original: true,

@@ -2,7 +2,28 @@ import assert from 'node:assert';
 import { randomUUID } from 'node:crypto';
 import { describe, it } from 'node:test';
 
-import { addDecision, isKnownFalsePositive, recordDismissal } from '../../consensus-core/ledger.js';
+import { addDecision, computeStats, isKnownFalsePositive, recordDismissal } from '../../consensus-core/ledger.js';
+
+describe('computeStats precision math', () => {
+  const base = { active: 0, superseded: 0, captured: 0, learnedPatterns: 0 };
+
+  it('computes precision from alert dismissals', () => {
+    assert.strictEqual(computeStats({ ...base, alertsFired: 4, dismissed: 1 }).precisionPct, 75);
+  });
+
+  it('clamps precision to 0 when dismissals exceed alerts (never negative)', () => {
+    // A stray accounting skew must never surface a negative percentage.
+    assert.strictEqual(computeStats({ ...base, alertsFired: 2, dismissed: 5 }).precisionPct, 0);
+  });
+
+  it('is null (undefined) when no alerts have fired', () => {
+    assert.strictEqual(computeStats({ ...base, alertsFired: 0, dismissed: 0 }).precisionPct, null);
+  });
+
+  it('is 100 when no alerts were dismissed', () => {
+    assert.strictEqual(computeStats({ ...base, alertsFired: 3, dismissed: 0 }).precisionPct, 100);
+  });
+});
 
 describe('dismissal memory', () => {
   it('recordDismissal makes a re-whitespaced/re-cased variant a known false positive', () => {

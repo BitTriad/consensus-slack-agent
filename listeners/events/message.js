@@ -29,8 +29,12 @@ export async function handleMessage({ client, context, event, logger, say, saySt
   if (isDm) {
     // DMs are always handled
   } else if (isThreadReply) {
-    // Channel thread replies are handled only if the bot is already engaged
-    const session = sessionStore.getSession(event.channel, /** @type {string} */ (event.thread_ts));
+    // Channel thread replies are handled only if the bot is already engaged.
+    // Sessions are per-(channel, thread, user) so users never share model memory.
+    const session = sessionStore.getSession(
+      event.channel,
+      `${/** @type {string} */ (event.thread_ts)}:${/** @type {string} */ (context.userId)}`,
+    );
     if (session === null) return;
   } else {
     // Top-level channel messages are handled by app_mentioned
@@ -42,9 +46,11 @@ export async function handleMessage({ client, context, event, logger, say, saySt
     const text = event.text || '';
     const threadTs = event.thread_ts || event.ts;
     const userId = /** @type {string} */ (context.userId);
+    // Sessions are per-(channel, thread, user) so users never share model memory.
+    const sessionKey = `${threadTs}:${userId}`;
 
     // Get session ID for conversation context
-    const existingSessionId = sessionStore.getSession(channelId, threadTs);
+    const existingSessionId = sessionStore.getSession(channelId, sessionKey);
 
     // Set assistant thread status with loading messages
     await setStatus({
@@ -66,6 +72,9 @@ export async function handleMessage({ client, context, event, logger, say, saySt
       threadTs,
       messageTs: event.ts,
       userToken: context.userToken || getStoredUserToken(userId) || undefined,
+      // A DM answer is private to the asker; a channel thread reply is readable by
+      // everyone in the channel. This drives the agent's provenance permission gate.
+      audience: /** @type {'dm'|'channel'} */ (event.channel_type === 'im' ? 'dm' : 'channel'),
     };
     const { responseText, sessionId: newSessionId } = await runAgent(text, existingSessionId ?? undefined, deps);
 
@@ -77,7 +86,7 @@ export async function handleMessage({ client, context, event, logger, say, saySt
 
     // Store session ID for future context
     if (newSessionId) {
-      sessionStore.setSession(channelId, threadTs, newSessionId);
+      sessionStore.setSession(channelId, sessionKey, newSessionId);
     }
   } catch (e) {
     logger.error(`Failed to handle message: ${e}`);

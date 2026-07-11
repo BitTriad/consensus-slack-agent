@@ -13,6 +13,51 @@ import { listDecisions, recordEvent } from './ledger.js';
 import { canSeeDecision } from './permissions.js';
 
 /**
+ * Audit metering. Audits are expensive (one scan call + one judge call per
+ * candidate pair), so we allow at most one at a time and impose a short cooldown
+ * between runs, shared across every surface (App Home button, @mention).
+ */
+const AUDIT_COOLDOWN_MS = 60_000;
+let auditInFlight = false;
+let lastAuditFinishedAt = 0;
+
+/**
+ * Atomically reserve the right to run an audit. Because JS is single-threaded,
+ * the check-and-set here completes synchronously before the caller awaits any
+ * audit work, so two near-simultaneous triggers can never both acquire. Returns
+ * true if the caller may proceed (and marks an audit in-flight); false if one is
+ * already running or finished less than the cooldown ago. Every successful
+ * acquire MUST be paired with a {@link releaseAudit} in a finally block.
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+export function tryAcquireAudit(now = Date.now()) {
+  if (auditInFlight) return false;
+  if (now - lastAuditFinishedAt < AUDIT_COOLDOWN_MS) return false;
+  auditInFlight = true;
+  return true;
+}
+
+/**
+ * Release the audit lock and start the cooldown clock. Idempotent.
+ * @param {number} [now]
+ * @returns {void}
+ */
+export function releaseAudit(now = Date.now()) {
+  auditInFlight = false;
+  lastAuditFinishedAt = now;
+}
+
+/**
+ * Test-only hook: clear the metering state so a test can run audits back-to-back.
+ * @returns {void}
+ */
+export function _resetAuditMeter() {
+  auditInFlight = false;
+  lastAuditFinishedAt = 0;
+}
+
+/**
  * @typedef {Object} AuditReport
  * @property {number} checkedCount
  * @property {import('./audit.js').ConfirmedConflict[]} visibleConfirmed Pairs the viewer may see in full.
@@ -27,14 +72,27 @@ import { canSeeDecision } from './permissions.js';
  * is private and the viewer is not a member of its channel, the whole pair is
  * excluded (fail-closed) and counted into `hiddenPrivateCount` — never any detail.
  *
+ * With `publicOnly` (used when the report is posted into a public channel thread
+ * every member can read), the gate is stricter and membership-free: a pair is
+ * shown ONLY when BOTH decisions are public. Any pair touching a private decision
+ * is excluded, with no membership calls.
+ *
+ * In `publicOnly` mode the returned report is additionally scrubbed of any hint
+ * that private-channel conflicts exist: `hiddenPrivateCount` is forced to 0 and
+ * `totalConfirmed` is set to `visibleConfirmed.length`. A report posted where the
+ * whole channel can read it must not disclose even the EXISTENCE or the COUNT of
+ * conflicts involving private channels — the "🔒 N additional conflicts…" summary
+ * line and the non-zero-vs-zero wording would otherwise leak exactly that.
+ *
  * @param {{
  *   client: import('@slack/web-api').WebClient,
  *   userId: string,
  *   logger?: import('@slack/bolt').Logger
  * }} args
+ * @param {{ publicOnly?: boolean }} [options]
  * @returns {Promise<AuditReport>}
  */
-export async function runAuditForViewer({ client, userId, logger }) {
+export async function runAuditForViewer({ client, userId, logger }, { publicOnly = false } = {}) {
   const decisions = listDecisions({ status: 'active', limit: 60 });
   const result = await runAudit({ decisions });
   recordEvent('audit_run');
@@ -43,11 +101,19 @@ export async function runAuditForViewer({ client, userId, logger }) {
   const visibleConfirmed = [];
   let hiddenPrivateCount = 0;
   for (const c of result.confirmed) {
-    // canSeeDecision short-circuits (no API call) for public decisions, and
-    // fails closed on any membership-lookup error → excluded, never leaked.
-    const aOk = await canSeeDecision(client, c.a, userId, logger);
-    const bOk = aOk ? await canSeeDecision(client, c.b, userId, logger) : false;
-    if (aOk && bOk) visibleConfirmed.push(c);
+    let visible;
+    if (publicOnly) {
+      // Public-channel report: show a pair only when BOTH decisions are public.
+      // No membership lookups — a private decision is never surfaced to a channel.
+      visible = !c.a.is_private && !c.b.is_private;
+    } else {
+      // canSeeDecision short-circuits (no API call) for public decisions, and
+      // fails closed on any membership-lookup error → excluded, never leaked.
+      const aOk = await canSeeDecision(client, c.a, userId, logger);
+      const bOk = aOk ? await canSeeDecision(client, c.b, userId, logger) : false;
+      visible = aOk && bOk;
+    }
+    if (visible) visibleConfirmed.push(c);
     else hiddenPrivateCount++;
   }
 
@@ -60,8 +126,11 @@ export async function runAuditForViewer({ client, userId, logger }) {
   return {
     checkedCount: result.checkedCount,
     visibleConfirmed,
-    hiddenPrivateCount,
-    totalConfirmed: result.confirmed.length,
+    // A public report must not disclose even the existence or count of
+    // private-channel conflicts: zero out the hidden count and report a
+    // workspace total that reflects only what is being shown publicly.
+    hiddenPrivateCount: publicOnly ? 0 : hiddenPrivateCount,
+    totalConfirmed: publicOnly ? visibleConfirmed.length : result.confirmed.length,
   };
 }
 

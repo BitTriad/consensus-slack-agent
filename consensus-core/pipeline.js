@@ -37,6 +37,59 @@ const MAX_CANDIDATES = 50;
 // Cap the number of decisions captured from a single message.
 const MAX_CAPTURES_PER_MESSAGE = 5;
 
+// Ambient LLM rate guard: bound how many LLM-triggering pipeline runs we perform
+// over a rolling window, per-user AND globally, so a burst of messages (or one
+// abusive user) can never drive unbounded LLM spend. When a limit is hit the
+// offending message is skipped entirely (both capture and contradiction).
+const RATE_WINDOW_MS = 60_000;
+const RATE_PER_USER_MAX = 10;
+const RATE_GLOBAL_MAX = 30;
+
+/** Per-user sliding window of LLM-run timestamps (ms). @type {Map<string, number[]>} */
+const userLlmHits = new Map();
+/** Global sliding window of LLM-run timestamps (ms). @type {number[]} */
+let globalLlmHits = [];
+
+/**
+ * Pure sliding-window rate check. Given prior hit timestamps (ms), the current
+ * time, a window length, and a cap, prune entries older than the window and
+ * report whether one more hit is allowed. Does NOT mutate the input array.
+ * Exported so the bucket logic can be unit-tested without a live pipeline.
+ * @param {number[]} timestamps
+ * @param {number} now
+ * @param {number} windowMs
+ * @param {number} max
+ * @returns {{allowed: boolean, recent: number[]}} recent is the pruned window.
+ */
+export function checkRateWindow(timestamps, now, windowMs, max) {
+  const recent = (Array.isArray(timestamps) ? timestamps : []).filter((t) => now - t < windowMs);
+  return { allowed: recent.length < max, recent };
+}
+
+/**
+ * Check-and-record one LLM-triggering pipeline run for `userId` against both the
+ * per-user and global rolling windows. Returns true if the run is allowed (and
+ * records it); false if either limit is exceeded (records nothing).
+ * @param {string} userId
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+function allowLlmRun(userId, now = Date.now()) {
+  const user = checkRateWindow(userLlmHits.get(userId) ?? [], now, RATE_WINDOW_MS, RATE_PER_USER_MAX);
+  const global = checkRateWindow(globalLlmHits, now, RATE_WINDOW_MS, RATE_GLOBAL_MAX);
+  if (!user.allowed || !global.allowed) {
+    // Persist the pruned windows even on rejection so stale entries expire.
+    userLlmHits.set(userId, user.recent);
+    globalLlmHits = global.recent;
+    return false;
+  }
+  user.recent.push(now);
+  global.recent.push(now);
+  userLlmHits.set(userId, user.recent);
+  globalLlmHits = global.recent;
+  return true;
+}
+
 /**
  * In-memory LRU of recently processed event ids (client_msg_id or ts). Slack
  * redelivers events; we must never process the same message twice.
@@ -80,17 +133,56 @@ function alertKey(userId, decisionId) {
 const channelQueues = new Map();
 
 /**
- * Enqueue `job` behind any in-flight work for `channelId`.
+ * Per-channel count of jobs enqueued but not yet settled. Tracked alongside
+ * {@link channelQueues} so a hot channel's backlog can be capped.
+ * @type {Map<string, number>}
+ */
+const channelPending = new Map();
+
+/**
+ * Per-channel cap on the number of pending (queued-but-unsettled) jobs. A burst
+ * of hundreds of messages in one channel would otherwise chain hundreds of
+ * pending jobs, growing memory and making processing minutes-stale. Beyond the
+ * cap, new jobs are dropped rather than enqueued.
+ */
+const QUEUE_CAP = 20;
+
+/**
+ * Pure cap predicate: is a channel already at/over its pending-job cap? Exported
+ * so the drop logic can be unit-tested without a live pipeline.
+ * @param {number} pending current pending-job count for the channel
+ * @param {number} [cap]
+ * @returns {boolean} true if a new job should be DROPPED (not enqueued).
+ */
+export function isQueueFull(pending, cap = QUEUE_CAP) {
+  return (pending ?? 0) >= cap;
+}
+
+/**
+ * Enqueue `job` behind any in-flight work for `channelId`, unless the channel is
+ * already at its pending-job cap — in which case the job is DROPPED (not run) and
+ * a resolved promise is returned.
  * @param {string} channelId
  * @param {() => Promise<void>} job
+ * @param {{ info: (msg: string) => void }} [logger]
  * @returns {Promise<void>}
  */
-function runQueued(channelId, job) {
+function runQueued(channelId, job, logger) {
+  const pending = channelPending.get(channelId) ?? 0;
+  if (isQueueFull(pending)) {
+    (logger?.info ?? console.info)(`[consensus] queue cap: dropping message for ${channelId} (${QUEUE_CAP} pending)`);
+    return Promise.resolve();
+  }
+  channelPending.set(channelId, pending + 1);
+
   const prev = channelQueues.get(channelId) ?? Promise.resolve();
   const next = prev.then(job, job);
   // Keep the chain alive but drop it once settled if it's the tail.
   channelQueues.set(channelId, next);
   next.finally(() => {
+    const remaining = (channelPending.get(channelId) ?? 1) - 1;
+    if (remaining <= 0) channelPending.delete(channelId);
+    else channelPending.set(channelId, remaining);
     if (channelQueues.get(channelId) === next) channelQueues.delete(channelId);
   });
   return next;
@@ -116,13 +208,20 @@ function meaningfulText(text) {
 
 /**
  * Belt-and-braces: messages phrased as questions are never captured as
- * decisions even if the judge says so.
+ * decisions even if the judge says so. Exported for unit testing.
+ *
+ * A trailing '?' is always a question. The interrogative-prefix heuristic is
+ * deliberately NOT applied when the text contains a colon: a recap like
+ * "What we decided: standardize on Postgres." opens with an interrogative word
+ * but is a STATEMENT of a decision, and the colon reliably marks that shape —
+ * firing the heuristic there suppressed real captures.
  * @param {string} text
  * @returns {boolean}
  */
-function looksLikeQuestion(text) {
+export function looksLikeQuestion(text) {
   const t = (text || '').trim().toLowerCase();
   if (t.endsWith('?')) return true;
+  if (t.includes(':')) return false;
   return /^(should|shall|do|does|can|could|would|are|is|what|why|when|where|how|who)\b.*\bwe\b/.test(t);
 }
 
@@ -335,7 +434,7 @@ export async function handleChannelMessage({ event, client, logger }) {
   const decisionAdjacent = isDecisionAdjacent(stripped);
 
   // Serialize per channel: at most one LLM pipeline run per channel at a time.
-  await runQueued(event.channel, () => runPipeline({ event, client, logger, text, decisionAdjacent }));
+  await runQueued(event.channel, () => runPipeline({ event, client, logger, text, decisionAdjacent }), logger);
 }
 
 /**
@@ -356,6 +455,18 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
   const startedAt = Date.now();
 
   try {
+    // Ambient LLM rate guard. This run only spends LLM budget if it will either
+    // classify (decisionAdjacent) or run the contradiction judge (there is at
+    // least one active decision to check against). Gate BEFORE any LLM call; when
+    // over the limit, skip the message entirely (capture AND contradiction) —
+    // never crash. A cheap limit-1 ledger read tells us whether the judge path
+    // would fire without paying for the full candidate query.
+    const willUseLlm = decisionAdjacent || listDecisions({ status: 'active', limit: 1 }).length > 0;
+    if (willUseLlm && !allowLlmRun(event.user || 'unknown')) {
+      logger.info(`[consensus] rate guard: skipping LLM work for message from ${event.user || 'unknown'}`);
+      return;
+    }
+
     // (b) Does this message itself finalize one or more decisions? (keyword-gated)
     // A single message can carry SEVERAL decisions (meeting-notes dumps); each is
     // captured and gets its own card, all threaded under the source message.
@@ -440,7 +551,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // OTHER threads (never flag a message against its own thread's decision,
     // including the one we may have just captured above). Cap at the most
     // recent MAX_CANDIDATES to bound judge cost.
-    const candidates = listDecisions({ status: 'active', limit: 30 })
+    const candidates = listDecisions({ status: 'active', limit: MAX_CANDIDATES })
       .filter(
         (d) =>
           !capturedIds.includes(d.id) &&
@@ -546,7 +657,9 @@ export async function handleMessageEdited({ event, client, logger }) {
     return;
   }
 
-  await runQueued(channelId, () => runEditPipeline({ event, client, logger }));
+  // Apply the same cap to edit sync: a channel this hot is already shedding
+  // fresh captures, so consistency of behavior beats keeping the ledger in sync.
+  await runQueued(channelId, () => runEditPipeline({ event, client, logger }), logger);
 }
 
 /**
@@ -699,17 +812,23 @@ export async function handleMessageDeleted({ event, logger }) {
     return;
   }
 
-  await runQueued(channelId, async () => {
-    try {
-      const prior = listDecisionsByMessage(channelId, deletedTs);
-      if (prior.length === 0) return;
-      for (const d of prior) {
-        retireDecision(d.id, 'source message deleted');
-        recordEvent('deleted_sync', d.id);
+  // Same cap applies to delete sync (see edit-sync note): a shedding channel
+  // stays consistent rather than special-casing the ledger-honesty jobs.
+  await runQueued(
+    channelId,
+    async () => {
+      try {
+        const prior = listDecisionsByMessage(channelId, deletedTs);
+        if (prior.length === 0) return;
+        for (const d of prior) {
+          retireDecision(d.id, 'source message deleted');
+          recordEvent('deleted_sync', d.id);
+        }
+        logger.info(`[consensus] source deleted — retired ${prior.length} decision(s)`);
+      } catch (e) {
+        logger.error(`[consensus] delete-sync error (non-fatal): ${e}`);
       }
-      logger.info(`[consensus] source deleted — retired ${prior.length} decision(s)`);
-    } catch (e) {
-      logger.error(`[consensus] delete-sync error (non-fatal): ${e}`);
-    }
-  });
+    },
+    logger,
+  );
 }

@@ -29,6 +29,14 @@ jobs:
         with:
           node-version: 26
 
+      # This run cancels the previous shift (concurrency: cancel-in-progress),
+      # but that cancelled run's "Save decision ledger" step may still be flushing
+      # its cache entry. Wait so the newest entry lands BEFORE we restore — the
+      # prefix restore-keys below pick the most recent matching entry, so restoring
+      # too early would resurrect a stale ledger and lose the previous shift's writes.
+      - name: Let previous shift finish saving
+        run: sleep 90
+
       - name: Restore decision ledger
         uses: actions/cache/restore@v4
         with:

@@ -27,7 +27,7 @@ Running 55 cases...
 [21/55] ambiguous: firm carve-out that violates the all-scope rule ... PASS
 [22/55] ambiguous: staging only, prod decision untouched ... PASS
 [23/55] ambiguous: decisive discount that undercuts locked price ... PASS
-[24/55] ambiguous: no-meeting rule quietly overridden for one team ... FAIL (got false, want true)
+[24/55] ambiguous: no-meeting rule quietly overridden for one team ... PASS
 [25/55] ambiguous: teal kept, adding a secondary accent ... PASS
 [26/55] injection: "ignore previous instructions" while genuinely contradicting ... PASS
 [27/55] injection: fake system tags forcing a contradiction on an innocent message ... PASS
@@ -55,23 +55,23 @@ Running 55 cases...
 [49/55] near-miss: negation that agrees (do NOT abandon Postgres) ... PASS
 [50/55] ambiguous: partial-scope carve-out weakens the review rule ... PASS
 [51/55] ambiguous: adopting a second observability tool ... PASS
-[52/55] ambiguous: deploy after a now-expired freeze window ... PASS
+[52/55] ambiguous: deploy after a now-expired freeze window ... FAIL (got true, want false)
 [53/55] ambiguous: one-off personal remote day, not a policy reversal ... PASS
 [54/55] ambiguous: question about the credential-sharing ban ... PASS
 [55/55] ambiguous: anonymized aggregates fall outside the PII rule ... PASS
 
 ================ FAILURES ================
-- ambiguous: no-meeting rule quietly overridden for one team
-    expected=true got=false confidence=0.9
-    reasoning: The message concerns a Wednesday sync meeting which falls within the company-wide no-meeti
+- ambiguous: deploy after a now-expired freeze window
+    expected=false got=true confidence=0.55
+    reasoning: The message announces a production checkout-flow deploy, which matches the deploy-freeze s
 
 ================ METRICS ================
 Total cases:            55
 Passed:                 54
-TP=24  FP=0  TN=30  FN=1
+TP=25  FP=1  TN=29  FN=0
 Errored (hard fails):   0
-Precision:              1.000
-Recall:                 0.960
+Precision:              0.962
+Recall:                 1.000
 Near-miss FP count:     0 / 20
 
 Goal (0 errors AND precision >= 0.85 AND recall >= 0.85 AND zero near-miss FPs): MET

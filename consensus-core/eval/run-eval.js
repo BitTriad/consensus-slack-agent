@@ -4,6 +4,33 @@ import { dataset } from './dataset.js';
 /**
  * Run judgeContradiction across the dataset, sequentially, and report metrics.
  */
+/**
+ * Run one case once. An error is either a thrown transport failure OR a returned
+ * verdict whose reasoning starts with 'ERROR' (a swallowed parse/transport
+ * failure that must never masquerade as a genuine "no contradiction" miss, or a
+ * dead model would score precision 1.000).
+ * @param {(typeof dataset)[number]} c
+ * @returns {Promise<{got: any, errored: boolean}>}
+ */
+async function runCase(c) {
+  try {
+    const got = await judgeContradiction(c.newMessage, c.priorDecisions);
+    const errored = typeof got.reasoning === 'string' && got.reasoning.startsWith('ERROR');
+    return { got, errored };
+  } catch (e) {
+    return {
+      got: {
+        isContradiction: false,
+        conflictingDecisionId: null,
+        confidence: 0,
+        reasoning: `ERROR: ${e?.message || e}`,
+        reopensDecision: false,
+      },
+      errored: true,
+    };
+  }
+}
+
 async function main() {
   const results = [];
 
@@ -11,24 +38,11 @@ async function main() {
   for (let i = 0; i < dataset.length; i++) {
     const c = dataset[i];
     process.stdout.write(`[${i + 1}/${dataset.length}] ${c.name} ... `);
-    let got;
-    let errored = false;
-    try {
-      got = await judgeContradiction(c.newMessage, c.priorDecisions);
-      // A judge that returns the safe default with zero confidence and an
-      // ERROR reasoning is a swallowed transport failure — surface it.
-      if (typeof got.reasoning === 'string' && got.reasoning.startsWith('ERROR')) errored = true;
-    } catch (e) {
-      // An LLM/transport error is a HARD failure — it must never masquerade as
-      // a "no contradiction" verdict, or a dead model scores precision 1.000.
-      errored = true;
-      got = {
-        isContradiction: false,
-        conflictingDecisionId: null,
-        confidence: 0,
-        reasoning: `ERROR: ${e?.message || e}`,
-        reopensDecision: false,
-      };
+    let { got, errored } = await runCase(c);
+    // Transient tolerance: an errored case (thrown OR 'ERROR' reasoning) gets ONE
+    // retry before it is recorded as a hard failure.
+    if (errored) {
+      ({ got, errored } = await runCase(c));
     }
     const pass = !errored && got.isContradiction === c.expected.isContradiction;
     console.log(

@@ -31,7 +31,7 @@
  * @property {number} learnedPatterns
  * @property {number|null} precisionPct
  *
- * @typedef {'alert_fired'|'dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'} EventKind
+ * @typedef {'alert_fired'|'dismissed'|'capture_dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'} EventKind
  *
  * @typedef {Object} LedgerBackend
  * @property {(d: Partial<Decision> & {id: string, statement: string, channel_id: string}) => Decision} addDecision
@@ -305,13 +305,20 @@ function createSqliteBackend(DatabaseSync) {
 }
 
 /**
- * Shared stats derivation so both backends agree on precision math.
+ * Shared stats derivation so both backends agree on precision math. `dismissed`
+ * counts ALERT dismissals only ('dismissed' events); rejecting a decision capture
+ * is recorded under the distinct 'capture_dismissed' kind and never feeds this
+ * precision math. precisionPct is clamped to 0..100 defensively so a stray
+ * accounting skew (e.g. more dismissals than recorded alerts) can never surface a
+ * negative or >100 percentage. Exported for unit testing.
  * @param {{active: number, superseded: number, captured: number, learnedPatterns: number, alertsFired: number, dismissed: number}} raw
  * @returns {Stats}
  */
-function computeStats(raw) {
+export function computeStats(raw) {
   const precisionPct =
-    raw.alertsFired > 0 ? Math.round(((raw.alertsFired - raw.dismissed) / raw.alertsFired) * 100) : null;
+    raw.alertsFired > 0
+      ? Math.min(100, Math.max(0, Math.round(((raw.alertsFired - raw.dismissed) / raw.alertsFired) * 100)))
+      : null;
   return {
     // Back-compat aliases.
     active: raw.active,
@@ -598,7 +605,7 @@ export function isAuditPairDismissed(aId, bId) {
 
 /**
  * Record a learning-loop event
- * (alert_fired | dismissed | superseded | captured | audit_run | edited_sync | deleted_sync).
+ * (alert_fired | dismissed | capture_dismissed | superseded | captured | audit_run | edited_sync | deleted_sync).
  * @param {EventKind} kind
  * @param {string | null} [decisionId]
  * @returns {void}

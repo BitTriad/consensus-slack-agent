@@ -77,4 +77,18 @@ describe('scan JSON defensive parser', () => {
     assert.deepStrictEqual(normalizeScanPairs({}, new Set(['1'])), []);
     assert.deepStrictEqual(normalizeScanPairs({ pairs: 'nope' }, new Set(['1'])), []);
   });
+
+  it('normalizeScanPairs caps output at 15 pairs', () => {
+    // 20 valid ids → 19 distinct pairs (1-2, 1-3, ... 1-20); the cap keeps 15.
+    const ids = Array.from({ length: 20 }, (_, i) => `d${i}`);
+    const valid = new Set(ids);
+    const pairs = ids.slice(1).map((bId) => ({ aId: 'd0', bId, why: 'x' }));
+    const out = normalizeScanPairs({ pairs }, valid);
+    assert.strictEqual(out.length, 15);
+    // The first 15 nominated pairs are the ones kept (order preserved).
+    assert.deepStrictEqual(
+      out.map((p) => p.bId),
+      ids.slice(1, 16),
+    );
+  });
 });

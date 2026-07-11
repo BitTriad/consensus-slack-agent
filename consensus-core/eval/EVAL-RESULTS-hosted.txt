@@ -54,24 +54,22 @@ Running 55 cases...
 [48/55] near-miss: discussing a competitor's choice ... PASS
 [49/55] near-miss: negation that agrees (do NOT abandon Postgres) ... PASS
 [50/55] ambiguous: partial-scope carve-out weakens the review rule ... PASS
-[51/55] ambiguous: adopting a second observability tool ... FAIL (got false, want true)
+[51/55] ambiguous: adopting a second observability tool ... PASS
 [52/55] ambiguous: deploy after a now-expired freeze window ... PASS
 [53/55] ambiguous: one-off personal remote day, not a policy reversal ... PASS
 [54/55] ambiguous: question about the credential-sharing ban ... PASS
 [55/55] ambiguous: anonymized aggregates fall outside the PII rule ... PASS
 
 ================ FAILURES ================
-- ambiguous: adopting a second observability tool
-    expected=true got=false confidence=0
-    reasoning: Failed to parse judge output; defaulting to no contradiction.
+(none)
 
 ================ METRICS ================
 Total cases:            55
-Passed:                 54
-TP=24  FP=0  TN=30  FN=1
+Passed:                 55
+TP=25  FP=0  TN=30  FN=0
 Errored (hard fails):   0
 Precision:              1.000
-Recall:                 0.960
+Recall:                 1.000
 Near-miss FP count:     0 / 20
 
 Goal (0 errors AND precision >= 0.85 AND recall >= 0.85 AND zero near-miss FPs): MET
