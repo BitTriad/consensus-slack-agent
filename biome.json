@@ -1,5 +1,8 @@
 {
   "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "files": {
+    "includes": ["**", "!.slack/**"]
+  },
   "formatter": {
     "enabled": true,
     "formatWithErrors": false,

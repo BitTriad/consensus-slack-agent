@@ -21,3 +21,8 @@ data/
 consensus.db
 consensus.db-*
 consensus-ledger.json
+
+# Slack CLI volatile state (rewritten on every `slack run`)
+.slack/apps.json
+.slack/apps.dev.json
+.slack/cache/

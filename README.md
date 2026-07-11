@@ -35,9 +35,9 @@ Built for the **Slack Agent Builder Challenge 2026** (Track 1: Best New Slack Ag
 
 | | |
 |---|---|
-| 📌 **Decision captured in-thread** — the ambient classifier files a settled decision to the ledger.<br/><!-- TODO: add screenshot docs/images/capture-card.png --> | ⚠️ **Contradiction alert** — private ephemeral warning with *supersede / not a conflict / show reasoning* buttons.<br/><!-- TODO: add screenshot docs/images/contradiction-alert.png --> |
-| 🙈 **REDACTED alert** — a non-member sees the conflict flagged, but no statement, channel, or link.<br/><!-- TODO: add screenshot docs/images/redacted-alert.png --> | 🔍 **Consistency audit** — two-stage sweep surfaces a latent-conflict pair of standing decisions.<br/><!-- TODO: add screenshot docs/images/audit-report.png --> |
-| 🏠 **App Home dashboard** — permission-filtered decision log with tracked precision.<br/><!-- TODO: add screenshot docs/images/app-home.png --> | |
+| 📌 **Decision captured in-thread** — the ambient classifier files a settled decision to the ledger, tagged with lifecycle state and owner.<br/><img src="docs/images/capture-card.png" alt="Decision captured card" /> | ⚠️ **Contradiction alert** — private ephemeral warning that a message conflicts with an active team policy, with *supersede / not a conflict / show reasoning* buttons.<br/><img src="docs/images/contradiction-alert.png" alt="Contradiction alert" /> |
+| 📝 **Proposed vs. active governance** — a decision from an untrusted channel stays *proposed* until an authorized owner Confirms it.<br/><img src="docs/images/proposed-card.png" alt="Proposed decision with Confirm/Reject" /> | 🔍 **Consistency audit** — two-stage sweep surfaces a latent-conflict pair of standing decisions (Sales guarantees API v1 vs. Engineering sunsets it).<br/><img src="docs/images/audit-report.png" alt="Consistency audit report" /> |
+| 🏠 **App Home dashboard** — permission-filtered decision log with lifecycle badges and tracked precision.<br/><img src="docs/images/app-home.png" alt="App Home dashboard" /> | |
 
 ## Measured, not claimed
 
