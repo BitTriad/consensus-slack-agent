@@ -52,10 +52,12 @@ Claude (local dev, Agent SDK)     54/55 · Precision 0.962 · Recall 1.000  (one
 
 Receipts committed for every stack — hosted [`EVAL-RESULTS-hosted.txt`](consensus-core/eval/EVAL-RESULTS-hosted.txt), gemma [`EVAL-RESULTS-hosted-gemma.txt`](consensus-core/eval/EVAL-RESULTS-hosted-gemma.txt), local Claude [`EVAL-RESULTS.txt`](consensus-core/eval/EVAL-RESULTS.txt) — same prompts throughout. The harness hard-fails on LLM errors (parse failures count as hard errors, with one transient retry, so a dead model can never score) and reports precision as UNDEFINED with zero predicted positives. Run it: `npm run eval`.
 
+The scores are high because the judge is good, not because the test is soft — read the cases yourself in [`consensus-core/eval/dataset.js`](consensus-core/eval/dataset.js): 20 near-misses (same technology different scope, agreeing negations, expired time windows, superseded decisions, sarcasm) and 6 adversarial prompt-injection attacks are in the set specifically to *break* a naive matcher. A keyword bot fails these; the scope-aware judge doesn't.
+
 ## Required technologies (all three)
 
 - **Real-Time Search API** (`assistant.search.context`) — live workspace search in **both paths**: the hosted brain augments provenance answers with live public-channel search (public-only by construction — the token is the app owner's, so restricting to workspace-public content makes it leak-proof for any asker), and the local per-user-OAuth path searches the full permission-aware `search:read.*` scope as the requesting user (demoed in the video).
-- **Slack MCP Server** — search/read/write tools, exercised on the same **local per-user-OAuth path** (shown in the video). The hosted cloud brain is ledger-grounded and does not call MCP.
+- **Slack MCP Server** — powers the agent's Slack tool-use (search / read / write) in the conversational path, where the Claude Agent SDK runs a real multi-turn tool loop over the MCP tools (load-bearing there; shown in the video). The hosted cloud brain is a single-shot completion with no tool loop by design, so it grounds on the ledger + live RTS instead.
 - **Slack AI / Agent & Assistant surface** — conversational provenance Q&A (both paths)
 
 ## Architecture

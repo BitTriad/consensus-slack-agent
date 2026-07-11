@@ -107,7 +107,7 @@ export async function searchContext(
     const res = /** @type {any} */ (
       await withTimeout(client.apiCall('assistant.search.context', args), RTS_TIMEOUT_MS)
     );
-    if (!res || res.ok !== true) {
+    if (res?.ok !== true) {
       log.info?.(`[consensus] rts: non-ok response (${res?.error || 'unknown'}) in ${Date.now() - started}ms`);
       return [];
     }
