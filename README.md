@@ -154,7 +154,7 @@ A team can run their **own** private instance, on their **own** keys, with their
 
 ## Roadmap
 
-- **Admin control dashboard + one-click install** *(next priority)* — an install-to-org OAuth flow and a self-serve config surface to opt channels in/out, tune sensitivity, and manage permissions in one place. Today setup is developer-driven (env vars + Slack CLI); a control panel is the biggest lever on adoption.
+- **Admin control dashboard + one-click install** — an install-to-org OAuth flow and a self-serve config surface to opt channels in/out, tune sensitivity, and manage permissions in one place, so any team can roll Consensus out in a click.
 - **Windowed dashboard stats** (7 / 30-day) — the schema is already there.
 - **Member-tenure gating & role-gated corrections** for open-invite communities.
 - **Deeper permission-aware search** and cross-message decision stitching.
