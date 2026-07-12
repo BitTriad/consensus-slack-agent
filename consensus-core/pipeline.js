@@ -569,7 +569,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // over the limit, skip the message entirely (capture AND contradiction) —
     // never crash. A cheap limit-1 ledger read tells us whether the judge path
     // would fire without paying for the full candidate query.
-    const willUseLlm = decisionAdjacent || listDecisions({ status: ENFORCEABLE_STATUSES, limit: 1 }).length > 0;
+    const willUseLlm = decisionAdjacent || (await listDecisions({ status: ENFORCEABLE_STATUSES, limit: 1 })).length > 0;
     if (willUseLlm && !allowLlmRun(event.user || 'unknown')) {
       logger.info(`[consensus] rate guard: skipping LLM work for message from ${event.user || 'unknown'}`);
       return;
@@ -607,7 +607,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // touches the contradiction path below — the message is still judged.
     const author = event.user || 'unknown';
     const captureAllowance = capturesAllowedToday(
-      countDecisionsByAuthorSince(author, utcDayStartIso()),
+      await countDecisionsByAuthorSince(author, utcDayStartIso()),
       toCapture.length,
     );
     if (captureAllowance < toCapture.length) {
@@ -636,7 +636,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
       const expiresAt = parseUntilDate(text);
 
       for (const c of capped) {
-        const decision = addDecision({
+        const decision = await addDecision({
           // Cap the captured statement so an over-long (or padded) classification
           // can't bloat the ledger row or downstream renders.
           statement: (c.statement || text.slice(0, 280)).slice(0, 500),
@@ -653,7 +653,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
           expires_at: expiresAt,
         });
         capturedIds.push(decision.id);
-        recordEvent('captured', decision.id);
+        await recordEvent('captured', decision.id);
 
         try {
           // One card per captured decision, all threaded under the source message
@@ -691,7 +691,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
     // expires_at) are contradiction candidates. proposed/exception/superseded/
     // expired/rejected rows are never hard-alerted, so they never reach the judge.
     const now = Date.now();
-    const candidates = listDecisions({ status: ENFORCEABLE_STATUSES, limit: MAX_CANDIDATES })
+    const candidates = (await listDecisions({ status: ENFORCEABLE_STATUSES, limit: MAX_CANDIDATES }))
       .filter(
         (d) =>
           isEnforceable(d, now) &&
@@ -732,7 +732,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
         const key = decision ? alertKey(event.user, decision.id) : '';
         // Per-user dismissal memory: only THIS author's own prior "not a conflict"
         // suppresses the re-alert (event.user is the alerted author).
-        if (decision && !isKnownFalsePositive(text, decision.id, event.user) && !alertedToday.has(key)) {
+        if (decision && !(await isKnownFalsePositive(text, decision.id, event.user)) && !alertedToday.has(key)) {
           // Permission boundary: never quote a private-channel decision to a
           // user who cannot see that channel.
           const visible = await canSeeDecision(client, decision, event.user, logger);
@@ -760,7 +760,7 @@ async function runPipeline({ event, client, logger, text, decisionAdjacent }) {
             // ephemeral post has actually succeeded. recordAlerted keeps the
             // in-memory Set self-pruning (drops non-today keys) and bounded.
             recordAlerted(key);
-            recordEvent('alert_fired', decision.id);
+            await recordEvent('alert_fired', decision.id);
           } catch (e) {
             logger.error(`[consensus] failed to post contradiction alert: ${e}`);
           }
@@ -825,7 +825,7 @@ async function runEditPipeline({ event, client, logger }) {
 
   try {
     // No captures from this message → nothing to reconcile. Cheapest exit, no LLM.
-    const prior = listDecisionsByMessage(channelId, originalTs);
+    const prior = await listDecisionsByMessage(channelId, originalTs);
     if (prior.length === 0) return;
 
     // A non-textual edit (e.g. Slack attaching a link unfurl) leaves the text
@@ -864,15 +864,18 @@ async function runEditPipeline({ event, client, logger }) {
     // Retire decisions whose statements no longer appear in the edited message.
     // Retirement is NOT a capture, so it is never affected by the daily cap below.
     for (const d of toRetire) {
-      retireDecision(d.id, `source message edited (${message.edited?.ts || ''})`);
-      recordEvent('edited_sync', d.id);
+      await retireDecision(d.id, `source message edited (${message.edited?.ts || ''})`);
+      await recordEvent('edited_sync', d.id);
     }
 
     // Daily per-user capture cap (abuse blunting), applied to edit-added decisions
     // too so an abuser can't launder captures through edits. Author is the
     // original message's author.
     const editAuthor = message.user || 'unknown';
-    const addAllowance = capturesAllowedToday(countDecisionsByAuthorSince(editAuthor, utcDayStartIso()), toAdd.length);
+    const addAllowance = capturesAllowedToday(
+      await countDecisionsByAuthorSince(editAuthor, utcDayStartIso()),
+      toAdd.length,
+    );
     if (addAllowance < toAdd.length) {
       logger.info(`[consensus] capture cap: ${editAuthor} hit ${MAX_CAPTURES_PER_USER_PER_DAY}/day, skipping capture`);
     }
@@ -894,7 +897,7 @@ async function runEditPipeline({ event, client, logger }) {
       const expiresAt = parseUntilDate(newText);
 
       for (const c of cappedAdd) {
-        const decision = addDecision({
+        const decision = await addDecision({
           statement: (c.statement || newText.slice(0, 280)).slice(0, 500),
           rationale: c.rationale,
           channel_id: channelId,
@@ -908,7 +911,7 @@ async function runEditPipeline({ event, client, logger }) {
           owner_user_id: message.user,
           expires_at: expiresAt,
         });
-        recordEvent('captured', decision.id);
+        await recordEvent('captured', decision.id);
         try {
           await client.chat.postMessage({
             channel: channelId,
@@ -983,11 +986,11 @@ export async function handleMessageDeleted({ event, logger }) {
     channelId,
     async () => {
       try {
-        const prior = listDecisionsByMessage(channelId, deletedTs);
+        const prior = await listDecisionsByMessage(channelId, deletedTs);
         if (prior.length === 0) return;
         for (const d of prior) {
-          retireDecision(d.id, 'source message deleted');
-          recordEvent('deleted_sync', d.id);
+          await retireDecision(d.id, 'source message deleted');
+          await recordEvent('deleted_sync', d.id);
         }
         logger.info(`[consensus] source deleted — retired ${prior.length} decision(s)`);
       } catch (e) {

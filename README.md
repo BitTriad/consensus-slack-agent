@@ -31,7 +31,13 @@ Built for the **Slack Agent Builder Challenge 2026** (Track 1: Best New Slack Ag
 
 ## See it in action
 
-<!-- TODO: add demo GIF docs/images/demo.gif from Scene-3 footage -->
+<div align="center">
+
+![Consensus in action](docs/images/demo.gif)
+
+*Ambient capture → cross-channel contradiction alert → proposed-vs-active governance → latent-conflict audit → dashboard.*
+
+</div>
 
 | | |
 |---|---|
@@ -74,7 +80,7 @@ flowchart TD
         gate{"Permission gate<br/>fail-closed membership check"}
     end
 
-    ledger[("Decision Ledger - SQLite")]
+    ledger[("Decision Ledger - MongoDB / SQLite")]
 
     subgraph surfaces ["Surfaces"]
         alert["Ephemeral alert<br/>full or REDACTED"]
@@ -111,7 +117,7 @@ Key modules — all in [`consensus-core/`](consensus-core/):
 |---|---|
 | `pipeline.js` | Ambient brain: pre-filter, capture, contradiction check, alerting |
 | `judge.js` | LLM classifier + scope-aware contradiction judge, injection-hardened (`<untrusted_*>` wrapping) |
-| `ledger.js` | SQLite (WAL) decision ledger + dismissal memory + event log, JSON fallback |
+| `ledger.js` | Decision ledger + dismissal memory + event log — **MongoDB** (durable, hosted) when `MONGODB_URI` is set, SQLite (WAL) / JSON fallback locally |
 | `permissions.js` | Fail-closed membership gate with 5-min cache |
 | `blocks.js` | Block Kit surfaces (cards, alerts, App Home) with mrkdwn sanitization |
 | `rts.js` | Real-Time Search wrapper (fail-open, 3s timeout) |

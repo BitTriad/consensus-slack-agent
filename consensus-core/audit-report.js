@@ -98,9 +98,11 @@ export async function runAuditForViewer({ client, userId, logger }, { publicOnly
   // are audited for latent conflicts — proposed/exception/superseded/expired/
   // rejected rows are never enforced, so a conflict among them is not actionable.
   const now = Date.now();
-  const decisions = listDecisions({ status: ['active', 'confirmed'], limit: 60 }).filter((d) => isEnforceable(d, now));
+  const decisions = (await listDecisions({ status: ['active', 'confirmed'], limit: 60 })).filter((d) =>
+    isEnforceable(d, now),
+  );
   const result = await runAudit({ decisions });
-  recordEvent('audit_run');
+  await recordEvent('audit_run');
 
   /** @type {import('./audit.js').ConfirmedConflict[]} */
   const visibleConfirmed = [];

@@ -294,7 +294,11 @@ export async function runAudit({ decisions }) {
   const scanned = await scanForConflictPairs(active);
 
   // Skip pairs the user already dismissed as "not a conflict".
-  const pairs = scanned.filter((p) => !isAuditPairDismissed(p.aId, p.bId));
+  /** @type {{aId: string, bId: string, why: string}[]} */
+  const pairs = [];
+  for (const p of scanned) {
+    if (!(await isAuditPairDismissed(p.aId, p.bId))) pairs.push(p);
+  }
 
   /** @type {ConfirmedConflict[]} */
   const confirmed = [];

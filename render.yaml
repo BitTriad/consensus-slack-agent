@@ -1,0 +1,56 @@
+# Render blueprint for the Consensus Slack agent (FREE tier).
+#
+# The agent talks to Slack via Socket Mode (outbound WebSocket), but Render's
+# free tier only offers Web Services, which must bind $PORT and are put to
+# sleep after ~15 min without inbound traffic. The start script therefore also
+# runs a tiny HTTP health server on $PORT (/healthz -> 200 "ok"); an external
+# pinger (cron-job.org or UptimeRobot, every ~10 min) keeps the instance awake.
+#
+# The free tier has NO persistent disk, so the durable ledger lives in MongoDB
+# Atlas (free M0): set MONGODB_URI (connection string) and MONGODB_DB. Data
+# persists natively across restarts — no snapshotting. On boot the ledger is
+# seeded from seed/seed-decisions.json only when the database is still empty.
+# CONSENSUS_DB_PATH is retained solely as the local SQLite/JSON fallback for
+# hosts/dev runs where MONGODB_URI is unset; it is no longer the durable store.
+#
+# First deploy: create from this blueprint, then enter the `sync: false`
+# secrets in the Render dashboard. See RENDER-MIGRATION.md for the runbook.
+services:
+  - type: web
+    name: consensus-agent
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: false
+    buildCommand: npm ci
+    # Seeds the ledger (idempotent) if empty, starts the /healthz server on
+    # $PORT, and runs the Socket-mode app. Ledger durability is MongoDB Atlas.
+    startCommand: npm run start:render
+    envVars:
+      # Pin Node to match the repo (Actions used node-version: 26; node:sqlite
+      # is stable in 26 and the ledger relies on it).
+      - key: NODE_VERSION
+        value: "26"
+      # Local ledger path — only used by the SQLite/JSON FALLBACK when
+      # MONGODB_URI is unset. Not the durable store on this host.
+      - key: CONSENSUS_DB_PATH
+        value: ./data/consensus.db
+      # MongoDB database name (durable ledger store).
+      - key: MONGODB_DB
+        value: consensus
+      # Secrets — entered in the Render dashboard, never committed.
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: SLACK_USER_TOKEN
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # MongoDB Atlas connection string (durable ledger). e.g.
+      # "mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/?retryWrites=true&w=majority"
+      - key: MONGODB_URI
+        sync: false

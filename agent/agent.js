@@ -271,7 +271,7 @@ export async function runAgent(text, sessionId = undefined, deps = undefined) {
         .split(/\s+/)
         .filter((t) => t.length > 2)
         .map((t) => t.replace(/s$/, '')); // crude singularization: databases → database
-      const all = listDecisions({ limit: 200 });
+      const all = await listDecisions({ limit: 200 });
       const textMatches = all.filter((d) => {
         const hay = `${d.statement} ${d.rationale ?? ''}`.toLowerCase();
         return terms.length === 0 ? true : terms.some((t) => hay.includes(t));
@@ -433,7 +433,7 @@ async function runAgentHosted(text, deps) {
     .split(/[^a-z0-9$]+/)
     .filter((t) => t.length > 2)
     .map((t) => t.replace(/s$/, ''));
-  const all = listDecisions({ limit: 200 });
+  const all = await listDecisions({ limit: 200 });
   // Small ledgers are inlined wholesale — keyword matching only kicks in at
   // scale, so synonym gaps ("databases" vs "Postgres") can't hide decisions.
   const matched =

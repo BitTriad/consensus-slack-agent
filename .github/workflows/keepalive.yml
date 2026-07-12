@@ -1,0 +1,30 @@
+name: Keep Render service awake
+
+# Wake-up backstop for the free-tier Render web service. The app's own
+# self-ping (scripts/start-render.mjs, via RENDER_EXTERNAL_URL) keeps a live
+# instance from idling; this cron exists to WAKE an instance that Render slept
+# or restarted (a dead process cannot ping itself). Hits /healthz every 10 min.
+#
+# Setup: gh variable set RENDER_HEALTH_URL --body "https://<host>.onrender.com/healthz"
+# Skips gracefully (with a notice) while the variable is unset.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '*/10 * * * *'
+
+concurrency:
+  group: consensus-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Ping /healthz
+        env:
+          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+        run: |
+          if [ -z "$RENDER_HEALTH_URL" ]; then echo "RENDER_HEALTH_URL not set — skipping"; exit 0; fi
+          curl -fsS --max-time 30 "$RENDER_HEALTH_URL"

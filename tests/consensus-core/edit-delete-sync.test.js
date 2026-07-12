@@ -5,7 +5,7 @@ import { addDecision, getDecision, listDecisionsByMessage, retireDecision } from
 import { diffStatements } from '../../consensus-core/pipeline.js';
 
 describe('listDecisionsByMessage', () => {
-  it('returns all rows for a message and only that message', () => {
+  it('returns all rows for a message and only that message', async () => {
     // Unique channel keeps this test isolated from any other rows in the store.
     const channelId = `C_MSGSYNC_${randomUUID()}`;
     const ts1 = `${Date.now()}.000100`;
@@ -20,30 +20,30 @@ describe('listDecisionsByMessage', () => {
       is_private: 0,
     };
 
-    const a = addDecision({ ...base, message_ts: ts1, statement: 'We are standardizing on Postgres.' });
-    const b = addDecision({ ...base, message_ts: ts1, statement: 'Hiring is frozen until Q3.' });
-    const c = addDecision({ ...base, message_ts: ts2, statement: 'The status page moves to Instatus.' });
+    const a = await addDecision({ ...base, message_ts: ts1, statement: 'We are standardizing on Postgres.' });
+    const b = await addDecision({ ...base, message_ts: ts1, statement: 'Hiring is frozen until Q3.' });
+    const c = await addDecision({ ...base, message_ts: ts2, statement: 'The status page moves to Instatus.' });
 
-    const forTs1 = listDecisionsByMessage(channelId, ts1);
+    const forTs1 = await listDecisionsByMessage(channelId, ts1);
     const ids1 = new Set(forTs1.map((d) => d.id));
     assert.strictEqual(forTs1.length, 2, 'both decisions from ts1 are returned');
     assert.ok(ids1.has(a.id) && ids1.has(b.id), 'returns exactly the two ts1 rows');
     assert.ok(!ids1.has(c.id), 'does not leak the ts2 row');
 
-    const forTs2 = listDecisionsByMessage(channelId, ts2);
+    const forTs2 = await listDecisionsByMessage(channelId, ts2);
     assert.strictEqual(forTs2.length, 1);
     assert.strictEqual(forTs2[0].id, c.id);
 
     // A message that produced nothing returns an empty array (cheap no-op path).
-    assert.deepStrictEqual(listDecisionsByMessage(channelId, `${Date.now()}.999999`), []);
+    assert.deepStrictEqual(await listDecisionsByMessage(channelId, `${Date.now()}.999999`), []);
   });
 });
 
 describe('retireDecision', () => {
-  it('sets status to superseded and is idempotent', () => {
+  it('sets status to superseded and is idempotent', async () => {
     const channelId = `C_RETIRE_${randomUUID()}`;
     const ts = `${Date.now()}.000300`;
-    const d = addDecision({
+    const d = await addDecision({
       statement: 'Deploys move to weekly.',
       rationale: null,
       channel_id: channelId,
@@ -54,14 +54,14 @@ describe('retireDecision', () => {
       confidence: 0.9,
       is_private: 0,
     });
-    assert.strictEqual(getDecision(d.id)?.status, 'active');
+    assert.strictEqual((await getDecision(d.id))?.status, 'active');
 
-    retireDecision(d.id, 'source message deleted');
-    assert.strictEqual(getDecision(d.id)?.status, 'superseded');
+    await retireDecision(d.id, 'source message deleted');
+    assert.strictEqual((await getDecision(d.id))?.status, 'superseded');
 
     // Re-retiring stays superseded (no throw, no status flip).
-    retireDecision(d.id, 'again');
-    assert.strictEqual(getDecision(d.id)?.status, 'superseded');
+    await retireDecision(d.id, 'again');
+    assert.strictEqual((await getDecision(d.id))?.status, 'superseded');
   });
 });
 

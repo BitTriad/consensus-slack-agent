@@ -2,9 +2,17 @@
  * Decision Ledger — durable store of detected team decisions and the learned
  * "not-a-conflict" memory (dismissals).
  *
- * Primary backend is Node's built-in `node:sqlite` (Node 22.5+ / stable in 26).
- * If it is unavailable at runtime, a tiny JSON-file store with the SAME public
- * interface is used instead, so callers never branch on the backend.
+ * Durable backend is MongoDB Atlas: when `MONGODB_URI` is set, the ledger reads
+ * and writes a MongoDB database (collections: decisions, events, dismissals,
+ * audit_dismissals) so data survives host restarts natively. When it is NOT set
+ * (local dev, CI, GitHub Actions), the ledger falls back to Node's built-in
+ * `node:sqlite`, and if that too is unavailable, to a tiny JSON-file store. All
+ * three expose the SAME interface, so callers never branch on the backend.
+ *
+ * NOTE: the MongoDB driver is async, so the top-level ledger functions and the
+ * backend methods are async. The SQLite/JSON backends return synchronously, but
+ * `await` on a non-Promise is a no-op, so a single async call site works for
+ * every backend.
  *
  * @typedef {Object} Decision
  * @property {string} id
@@ -42,31 +50,63 @@
  *
  * @typedef {'alert_fired'|'dismissed'|'capture_dismissed'|'superseded'|'captured'|'audit_run'|'edited_sync'|'deleted_sync'|'confirmed'|'rejected'|'exception'} EventKind
  *
+ * A backend method may return its value synchronously (SQLite/JSON) or as a
+ * Promise (MongoDB). Callers always `await`, so both shapes are interchangeable;
+ * each property below is typed as `T | Promise<T>`.
+ *
  * @typedef {Object} LedgerBackend
- * @property {(d: Partial<Decision> & {id: string, statement: string, channel_id: string}) => Decision} addDecision
- * @property {(opts?: {status?: string | string[], limit?: number}) => Decision[]} listDecisions
- * @property {(channelId: string, messageTs: string) => Decision[]} listDecisionsByMessage
- * @property {(id: string) => Decision | null} getDecision
- * @property {(id: string, byId: string | null) => void} supersede
- * @property {(id: string) => void} dismiss
- * @property {(id: string, status: Decision['status']) => void} setStatus
- * @property {(newMessageText: string, matchedDecisionId: string, userId: string | null) => void} recordDismissal
- * @property {(newMessageText: string, decisionId: string, userId: string | null) => boolean} isKnownFalsePositive
- * @property {(aId: string, bId: string) => void} recordAuditDismissal
- * @property {(aId: string, bId: string) => boolean} isAuditPairDismissed
- * @property {(userId: string, isoTimestamp: string) => number} countDecisionsByAuthorSince
- * @property {(kind: EventKind, decisionId: string | null) => void} recordEvent
- * @property {() => Stats} stats
+ * @property {(d: Partial<Decision> & {id: string, statement: string, channel_id: string}) => Decision | Promise<Decision>} addDecision
+ * @property {(opts?: {status?: string | string[], limit?: number}) => Decision[] | Promise<Decision[]>} listDecisions
+ * @property {(channelId: string, messageTs: string) => Decision[] | Promise<Decision[]>} listDecisionsByMessage
+ * @property {(id: string) => (Decision | null) | Promise<Decision | null>} getDecision
+ * @property {(id: string, byId: string | null) => void | Promise<void>} supersede
+ * @property {(id: string) => void | Promise<void>} dismiss
+ * @property {(id: string, status: Decision['status']) => void | Promise<void>} setStatus
+ * @property {(newMessageText: string, matchedDecisionId: string, userId: string | null) => void | Promise<void>} recordDismissal
+ * @property {(newMessageText: string, decisionId: string, userId: string | null) => boolean | Promise<boolean>} isKnownFalsePositive
+ * @property {(aId: string, bId: string) => void | Promise<void>} recordAuditDismissal
+ * @property {(aId: string, bId: string) => boolean | Promise<boolean>} isAuditPairDismissed
+ * @property {(userId: string, isoTimestamp: string) => number | Promise<number>} countDecisionsByAuthorSince
+ * @property {(kind: EventKind, decisionId: string | null) => void | Promise<void>} recordEvent
+ * @property {() => Stats | Promise<Stats>} stats
+ * @property {() => Promise<void>} [connect] Establish the connection + indexes once (MongoDB only).
+ * @property {() => Promise<void>} [close] Close the connection (MongoDB only; used by tests).
  */
 
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { MongoClient } from 'mongodb';
 import { mapLegacyStatus } from './governance.js';
 
 const require = createRequire(import.meta.url);
 
-const DB_PATH = './consensus.db';
-const JSON_PATH = './consensus-ledger.json';
+/**
+ * MongoDB connection string. When set, the ledger uses MongoDB as its durable
+ * store (data persists natively across restarts); when unset, the SQLite/JSON
+ * fallback is used. Never committed — supplied via env (Render dashboard).
+ * @type {string | undefined}
+ */
+const MONGODB_URI = process.env.MONGODB_URI;
+/**
+ * MongoDB database name for the ledger. Defaults to `consensus`.
+ * @type {string}
+ */
+const MONGODB_DB = process.env.MONGODB_DB || 'consensus';
+
+/**
+ * SQLite ledger file path. Defaults to the repo-local `./consensus.db` (the
+ * historical GitHub Actions behavior), but is overridable via
+ * `CONSENSUS_DB_PATH` so hosts with a persistent disk (e.g. a Render worker
+ * mounting a volume at /data) can point the ledger at durable storage.
+ * @type {string}
+ */
+const DB_PATH = process.env.CONSENSUS_DB_PATH || './consensus.db';
+/**
+ * JSON-fallback ledger path, derived from {@link DB_PATH} so both backends live
+ * on the same (possibly persistent) volume. `foo.db` -> `foo-ledger.json`.
+ * @type {string}
+ */
+const JSON_PATH = DB_PATH.replace(/\.db$/, '') + '-ledger.json';
 
 /**
  * Max prefix length used for dismissal matching. The contradiction alert's
@@ -610,10 +650,263 @@ export function createJsonBackend(jsonPath = JSON_PATH) {
 }
 
 /**
- * Select the best available backend once, at module load.
+ * Build the MongoDB-backed ledger — the durable production store. Reuses ONE
+ * {@link MongoClient} (the driver pools connections internally), so callers never
+ * reconnect per operation. Every method awaits {@link ensureConnected} first,
+ * which connects + creates indexes exactly once.
+ *
+ * Collections:
+ *   - `decisions`         one document per captured decision (`_id` = decision id)
+ *   - `events`            learning-loop events (alert_fired, dismissed, …)
+ *   - `dismissals`        per-user "not a conflict" memory
+ *   - `audit_dismissals`  dismissed audit PAIRS (`_id` = pair_key)
+ *
+ * Uniqueness on (channel_id, message_ts, statement) is enforced by a PARTIAL
+ * unique index limited to rows whose message_ts is a string — matching SQLite,
+ * where a NULL message_ts is distinct and never collides.
+ * @param {{uri: string, dbName: string}} opts
  * @returns {LedgerBackend}
  */
-function selectBackend() {
+export function createMongoBackend({ uri, dbName }) {
+  const client = new MongoClient(uri);
+  /** @type {Promise<void> | null} Memoized connect+index promise. */
+  let ready = null;
+  const db = () => client.db(dbName);
+  const decisions = () => db().collection('decisions');
+  const dismissals = () => db().collection('dismissals');
+  const events = () => db().collection('events');
+  const auditDismissals = () => db().collection('audit_dismissals');
+
+  /**
+   * Connect once and create indexes once. Idempotent: the memoized promise means
+   * concurrent first-calls share a single connect.
+   * @returns {Promise<void>}
+   */
+  function ensureConnected() {
+    if (!ready) {
+      ready = (async () => {
+        await client.connect();
+        // Uniqueness parity with SQLite's idx_decisions_msg_stmt: only rows with
+        // a string message_ts participate, so NULL-ts rows never collide.
+        await decisions().createIndex(
+          { channel_id: 1, message_ts: 1, statement: 1 },
+          { unique: true, partialFilterExpression: { message_ts: { $type: 'string' } } },
+        );
+        await decisions().createIndex({ created_at: -1 });
+        await decisions().createIndex({ channel_id: 1, message_ts: 1 });
+        await decisions().createIndex({ decided_by: 1, created_at: 1 });
+        await dismissals().createIndex({ matched_decision_id: 1, user_id: 1 });
+        await events().createIndex({ kind: 1 });
+      })();
+    }
+    return ready;
+  }
+
+  /**
+   * Strip Mongo's `_id` from a decision document so the returned shape is exactly
+   * a {@link Decision}. `_id` mirrors `id`, so no data is lost.
+   * @param {any} doc
+   * @returns {Decision | null}
+   */
+  function stripId(doc) {
+    if (!doc) return null;
+    const { _id, ...rest } = doc;
+    void _id;
+    return /** @type {Decision} */ (rest);
+  }
+
+  return {
+    async addDecision(d) {
+      await ensureConnected();
+      /** @type {Decision} */
+      const row = {
+        id: d.id,
+        statement: d.statement,
+        rationale: d.rationale ?? null,
+        channel_id: d.channel_id,
+        channel_name: d.channel_name ?? null,
+        decided_by: d.decided_by ?? null,
+        message_ts: d.message_ts ?? null,
+        permalink: d.permalink ?? null,
+        status: d.status ?? 'active',
+        confidence: typeof d.confidence === 'number' ? d.confidence : 0,
+        created_at: d.created_at ?? new Date().toISOString(),
+        is_private: d.is_private ? 1 : 0,
+        team_label: d.team_label ?? null,
+        applies_to: d.applies_to ?? null,
+        expires_at: d.expires_at ?? null,
+        owner_user_id: d.owner_user_id ?? null,
+        authority_level: d.authority_level ?? null,
+        exception_of: d.exception_of ?? null,
+      };
+      // Durable dedup parity with SQLite (INSERT OR IGNORE): a redelivered
+      // (channel_id, message_ts, statement) returns the existing row. Fast path
+      // is a findOne; the unique index is the backstop against a concurrent race.
+      if (row.message_ts != null) {
+        const existing = await decisions().findOne({
+          channel_id: row.channel_id,
+          message_ts: row.message_ts,
+          statement: row.statement,
+        });
+        if (existing) return /** @type {Decision} */ (stripId(existing));
+      }
+      try {
+        await decisions().insertOne({ _id: /** @type {any} */ (row.id), ...row });
+      } catch (e) {
+        // Duplicate key (11000): a concurrent insert won the race — return the
+        // now-existing row rather than a phantom. Same net behavior as OR IGNORE.
+        if (/** @type {any} */ (e)?.code === 11000) {
+          const existing =
+            (row.message_ts != null
+              ? await decisions().findOne({
+                  channel_id: row.channel_id,
+                  message_ts: row.message_ts,
+                  statement: row.statement,
+                })
+              : null) ?? (await decisions().findOne({ _id: /** @type {any} */ (row.id) }));
+          if (existing) return /** @type {Decision} */ (stripId(existing));
+        }
+        throw e;
+      }
+      return row;
+    },
+    async listDecisions({ status, limit = 50 } = {}) {
+      await ensureConnected();
+      const statuses = Array.isArray(status) ? status : status ? [status] : [];
+      /** @type {Record<string, any>} */
+      const filter = {};
+      if (statuses.length > 0) filter.status = { $in: statuses };
+      const docs = await decisions()
+        .find(filter, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .limit(limit)
+        .toArray();
+      return /** @type {Decision[]} */ (/** @type {unknown} */ (docs));
+    },
+    async listDecisionsByMessage(channelId, messageTs) {
+      await ensureConnected();
+      if (messageTs == null) return [];
+      const docs = await decisions()
+        .find({ channel_id: channelId, message_ts: messageTs }, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .toArray();
+      return /** @type {Decision[]} */ (/** @type {unknown} */ (docs));
+    },
+    async getDecision(id) {
+      await ensureConnected();
+      return stripId(await decisions().findOne({ _id: /** @type {any} */ (id) }, { projection: {} }));
+    },
+    async supersede(id, byId) {
+      await ensureConnected();
+      await decisions().updateOne({ _id: /** @type {any} */ (id) }, { $set: { status: 'superseded' } });
+      void byId;
+    },
+    async dismiss(id) {
+      await ensureConnected();
+      await decisions().updateOne({ _id: /** @type {any} */ (id) }, { $set: { status: 'rejected' } });
+    },
+    async setStatus(id, status) {
+      await ensureConnected();
+      await decisions().updateOne({ _id: /** @type {any} */ (id) }, { $set: { status } });
+    },
+    async recordDismissal(newMessageText, matchedDecisionId, userId) {
+      await ensureConnected();
+      await dismissals().insertOne({
+        id: randomUUID(),
+        new_message_text: newMessageText,
+        matched_decision_id: matchedDecisionId,
+        user_id: userId ?? null,
+        dismissed_at: new Date().toISOString(),
+      });
+    },
+    async isKnownFalsePositive(newMessageText, decisionId, userId) {
+      await ensureConnected();
+      const target = normalize(newMessageText);
+      if (!target) return false;
+      // A lookup without a user id (or against legacy null rows) matches no one.
+      if (userId == null) return false;
+      const rows = /** @type {{new_message_text: string}[]} */ (
+        /** @type {unknown} */ (
+          await dismissals()
+            .find({ matched_decision_id: decisionId, user_id: userId }, { projection: { new_message_text: 1, _id: 0 } })
+            .toArray()
+        )
+      );
+      return rows.some((r) => normalize(r.new_message_text) === target);
+    },
+    async countDecisionsByAuthorSince(userId, isoTimestamp) {
+      await ensureConnected();
+      return decisions().countDocuments({ decided_by: userId, created_at: { $gte: isoTimestamp } });
+    },
+    async recordAuditDismissal(aId, bId) {
+      await ensureConnected();
+      const key = auditPairKey(aId, bId);
+      // Upsert on the pair key so a repeat dismissal is a no-op (parity with the
+      // SQLite INSERT OR IGNORE); created_at is only written on first insert.
+      await auditDismissals().updateOne(
+        { _id: /** @type {any} */ (key) },
+        { $setOnInsert: { pair_key: key, created_at: new Date().toISOString() } },
+        { upsert: true },
+      );
+    },
+    async isAuditPairDismissed(aId, bId) {
+      await ensureConnected();
+      return (await auditDismissals().findOne({ _id: /** @type {any} */ (auditPairKey(aId, bId)) })) != null;
+    },
+    async recordEvent(kind, decisionId) {
+      await ensureConnected();
+      await events().insertOne({
+        id: randomUUID(),
+        kind,
+        decision_id: decisionId ?? null,
+        created_at: new Date().toISOString(),
+      });
+    },
+    async stats() {
+      await ensureConnected();
+      const statusAgg = /** @type {{_id: string, n: number}[]} */ (
+        await decisions()
+          .aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }])
+          .toArray()
+      );
+      const byStatus = Object.fromEntries(statusAgg.map((c) => [c._id, c.n]));
+      const totalDecisions = await decisions().countDocuments({});
+      const learnedPatterns = await dismissals().countDocuments({});
+      const kindAgg = /** @type {{_id: string, n: number}[]} */ (
+        await events()
+          .aggregate([{ $group: { _id: '$kind', n: { $sum: 1 } } }])
+          .toArray()
+      );
+      const byKind = Object.fromEntries(kindAgg.map((c) => [c._id, c.n]));
+      return computeStats({
+        active: (byStatus.active ?? 0) + (byStatus.confirmed ?? 0),
+        superseded: byStatus.superseded ?? 0,
+        captured: totalDecisions,
+        learnedPatterns,
+        alertsFired: byKind.alert_fired ?? 0,
+        dismissed: byKind.dismissed ?? 0,
+      });
+    },
+    connect: ensureConnected,
+    async close() {
+      await client.close();
+    },
+  };
+}
+
+/**
+ * Select the best available backend once, at module load. Prefers MongoDB when
+ * `MONGODB_URI` is set (durable, survives restarts), else SQLite, else the JSON
+ * fallback. Async because the MongoDB client connects + builds indexes before
+ * the first operation.
+ * @returns {Promise<LedgerBackend>}
+ */
+async function selectBackend() {
+  if (MONGODB_URI) {
+    const mongo = createMongoBackend({ uri: MONGODB_URI, dbName: MONGODB_DB });
+    await mongo.connect?.();
+    return mongo;
+  }
   try {
     const { DatabaseSync } = require('node:sqlite');
     if (DatabaseSync) return createSqliteBackend(DatabaseSync);
@@ -623,14 +916,29 @@ function selectBackend() {
   return createJsonBackend();
 }
 
-const backend = selectBackend();
+/**
+ * Lazily-resolved backend singleton. Memoized so the (possibly async) selection
+ * and MongoDB connect happen exactly once, and every ledger call reuses the same
+ * pooled client.
+ * @type {Promise<LedgerBackend> | null}
+ */
+let backendPromise = null;
+
+/**
+ * @returns {Promise<LedgerBackend>}
+ */
+function getBackend() {
+  if (!backendPromise) backendPromise = selectBackend();
+  return backendPromise;
+}
 
 /**
  * Add a decision to the ledger. Generates an id if none is supplied.
  * @param {Partial<Decision> & {statement: string, channel_id: string, id?: string}} d
- * @returns {Decision}
+ * @returns {Promise<Decision>}
  */
-export function addDecision(d) {
+export async function addDecision(d) {
+  const backend = await getBackend();
   return backend.addDecision({ id: d.id ?? randomUUID(), ...d });
 }
 
@@ -638,9 +946,10 @@ export function addDecision(d) {
  * List decisions, newest first, optionally filtered by status (a single status
  * or an array of statuses matched with SQL `IN`).
  * @param {{status?: string | string[], limit?: number}} [opts]
- * @returns {Decision[]}
+ * @returns {Promise<Decision[]>}
  */
-export function listDecisions(opts = {}) {
+export async function listDecisions(opts = {}) {
+  const backend = await getBackend();
   return backend.listDecisions(opts);
 }
 
@@ -650,18 +959,20 @@ export function listDecisions(opts = {}) {
  * corrections to the original message.
  * @param {string} channelId
  * @param {string} messageTs
- * @returns {Decision[]}
+ * @returns {Promise<Decision[]>}
  */
-export function listDecisionsByMessage(channelId, messageTs) {
+export async function listDecisionsByMessage(channelId, messageTs) {
+  const backend = await getBackend();
   return backend.listDecisionsByMessage(channelId, messageTs);
 }
 
 /**
  * Fetch a single decision by id.
  * @param {string} id
- * @returns {Decision | null}
+ * @returns {Promise<Decision | null>}
  */
-export function getDecision(id) {
+export async function getDecision(id) {
+  const backend = await getBackend();
   return backend.getDecision(id);
 }
 
@@ -671,30 +982,33 @@ export function getDecision(id) {
  * `reason` is contextual only — it is logged by callers, never stored.
  * @param {string} id
  * @param {string} [reason]
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function retireDecision(id, reason) {
+export async function retireDecision(id, reason) {
   void reason;
-  backend.supersede(id, null);
+  const backend = await getBackend();
+  await backend.supersede(id, null);
 }
 
 /**
  * Mark a decision superseded (optionally by another decision's id).
  * @param {string} id
  * @param {string | null} [byId]
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function supersede(id, byId = null) {
-  backend.supersede(id, byId);
+export async function supersede(id, byId = null) {
+  const backend = await getBackend();
+  await backend.supersede(id, byId);
 }
 
 /**
  * Mark a captured row as not-a-decision (status 'rejected').
  * @param {string} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function dismissDecision(id) {
-  backend.dismiss(id);
+export async function dismissDecision(id) {
+  const backend = await getBackend();
+  await backend.dismiss(id);
 }
 
 /**
@@ -703,10 +1017,11 @@ export function dismissDecision(id) {
  * (see governance.canConfirm) — the ledger just records the state.
  * @param {string} id
  * @param {Decision['status']} status
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function setDecisionStatus(id, status) {
-  backend.setStatus(id, status);
+export async function setDecisionStatus(id, status) {
+  const backend = await getBackend();
+  await backend.setStatus(id, status);
 }
 
 /**
@@ -724,10 +1039,11 @@ export function setDecisionStatus(id, status) {
  * @param {string} newMessageText
  * @param {string} matchedDecisionId
  * @param {string | null} [userId] the dismissing user (from the action body)
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function recordDismissal(newMessageText, matchedDecisionId, userId = null) {
-  backend.recordDismissal(newMessageText, matchedDecisionId, userId);
+export async function recordDismissal(newMessageText, matchedDecisionId, userId = null) {
+  const backend = await getBackend();
+  await backend.recordDismissal(newMessageText, matchedDecisionId, userId);
 }
 
 /**
@@ -739,9 +1055,10 @@ export function recordDismissal(newMessageText, matchedDecisionId, userId = null
  * @param {string} newMessageText
  * @param {string} decisionId
  * @param {string | null} [userId] the message author being alerted
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-export function isKnownFalsePositive(newMessageText, decisionId, userId = null) {
+export async function isKnownFalsePositive(newMessageText, decisionId, userId = null) {
+  const backend = await getBackend();
   return backend.isKnownFalsePositive(newMessageText, decisionId, userId);
 }
 
@@ -752,9 +1069,10 @@ export function isKnownFalsePositive(newMessageText, decisionId, userId = null) 
  * @param {string} userId
  * @param {string} isoTimestamp ISO-8601; created_at is stored in the same format,
  *   so a lexicographic `>=` compare is a correct chronological compare.
- * @returns {number}
+ * @returns {Promise<number>}
  */
-export function countDecisionsByAuthorSince(userId, isoTimestamp) {
+export async function countDecisionsByAuthorSince(userId, isoTimestamp) {
+  const backend = await getBackend();
   return backend.countDecisionsByAuthorSince(userId, isoTimestamp);
 }
 
@@ -763,19 +1081,21 @@ export function countDecisionsByAuthorSince(userId, isoTimestamp) {
  * consistency audit), so the pair is never re-surfaced by a future audit.
  * @param {string} aId
  * @param {string} bId
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function recordAuditDismissal(aId, bId) {
-  backend.recordAuditDismissal(aId, bId);
+export async function recordAuditDismissal(aId, bId) {
+  const backend = await getBackend();
+  await backend.recordAuditDismissal(aId, bId);
 }
 
 /**
  * Whether this decision pair was previously dismissed as not-a-conflict in an audit.
  * @param {string} aId
  * @param {string} bId
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-export function isAuditPairDismissed(aId, bId) {
+export async function isAuditPairDismissed(aId, bId) {
+  const backend = await getBackend();
   return backend.isAuditPairDismissed(aId, bId);
 }
 
@@ -784,16 +1104,18 @@ export function isAuditPairDismissed(aId, bId) {
  * (alert_fired | dismissed | capture_dismissed | superseded | captured | audit_run | edited_sync | deleted_sync | confirmed | rejected | exception).
  * @param {EventKind} kind
  * @param {string | null} [decisionId]
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function recordEvent(kind, decisionId = null) {
-  backend.recordEvent(kind, decisionId);
+export async function recordEvent(kind, decisionId = null) {
+  const backend = await getBackend();
+  await backend.recordEvent(kind, decisionId);
 }
 
 /**
  * Ledger summary counts for the App Home dashboard.
- * @returns {Stats}
+ * @returns {Promise<Stats>}
  */
-export function stats() {
+export async function stats() {
+  const backend = await getBackend();
   return backend.stats();
 }

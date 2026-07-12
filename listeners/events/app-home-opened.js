@@ -41,7 +41,7 @@ export async function handleAppHomeOpened({ client, event, context, logger }) {
     const viewer = /** @type {string} */ (event.user);
     // Fetch a wider window (50) and permission-filter BEFORE trimming to 15, so
     // private rows the viewer can't see don't crowd out visible ones in the log.
-    const all = listDecisions({ status: undefined, limit: 50 });
+    const all = await listDecisions({ status: undefined, limit: 50 });
     const visible = [];
     for (const d of all) {
       if (await canSeeDecision(client, d, viewer, logger)) visible.push(d);
@@ -49,7 +49,7 @@ export async function handleAppHomeOpened({ client, event, context, logger }) {
     }
 
     // Render the Consensus dashboard from live ledger data.
-    const view = homeView({ stats: stats(), decisions: visible, lastAudit: getLastAudit() });
+    const view = homeView({ stats: await stats(), decisions: visible, lastAudit: getLastAudit() });
     await client.views.publish({ user_id: userId, view });
   } catch (e) {
     logger.error(`Failed to handle app_home_opened: ${e}`);

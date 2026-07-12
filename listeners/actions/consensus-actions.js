@@ -52,8 +52,8 @@ export async function handleDismiss({ ack, body, respond, logger }) {
     // ephemeral, so the clicker is always the alerted author.
     const userId = /** @type {any} */ (body).user?.id ?? null;
     if (parsed.decisionId) {
-      recordDismissal(messageText, parsed.decisionId, userId);
-      recordEvent('dismissed', parsed.decisionId);
+      await recordDismissal(messageText, parsed.decisionId, userId);
+      await recordEvent('dismissed', parsed.decisionId);
     }
     await respond({
       replace_original: true,
@@ -75,8 +75,8 @@ export async function handleConfirmSupersede({ ack, body, respond, logger }) {
   try {
     const decisionId = actionValue(body);
     if (decisionId) {
-      supersede(decisionId, null);
-      recordEvent('superseded', decisionId);
+      await supersede(decisionId, null);
+      await recordEvent('superseded', decisionId);
     }
     await respond({
       replace_original: true,
@@ -159,9 +159,9 @@ export async function handleCardSupersede({ ack, body, respond, logger }) {
     if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
     const id = actionValue(body);
     if (!id) return;
-    supersede(id, null);
-    recordEvent('superseded', id);
-    const decision = getDecision(id);
+    await supersede(id, null);
+    await recordEvent('superseded', id);
+    const decision = await getDecision(id);
     if (decision) {
       await replaceWithCard(respond, decision, `🔁 Decision marked *superseded*: ${decision.statement}`);
     } else {
@@ -185,9 +185,9 @@ export async function handleConfirm({ ack, body, respond, logger }) {
     if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
     const id = actionValue(body);
     if (!id) return;
-    setDecisionStatus(id, 'confirmed');
-    recordEvent('confirmed', id);
-    const decision = getDecision(id);
+    await setDecisionStatus(id, 'confirmed');
+    await recordEvent('confirmed', id);
+    const decision = await getDecision(id);
     if (decision) {
       await replaceWithCard(respond, decision, `✅ Decision *confirmed*: ${decision.statement}`);
     } else {
@@ -210,8 +210,8 @@ export async function handleReject({ ack, body, respond, logger }) {
     if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
     const id = actionValue(body);
     if (!id) return;
-    setDecisionStatus(id, 'rejected');
-    recordEvent('rejected', id);
+    await setDecisionStatus(id, 'rejected');
+    await recordEvent('rejected', id);
     await respond({
       replace_original: true,
       text: '🚫 Rejected — I won’t track this as a team decision.',
@@ -253,9 +253,9 @@ export async function handleMarkException({ ack, body, respond, logger }) {
     if (!canConfirm(userId)) return void (await refuseUnauthorized(respond));
     const id = actionValue(body);
     if (!id) return;
-    setDecisionStatus(id, 'exception');
-    recordEvent('exception', id);
-    const decision = getDecision(id);
+    await setDecisionStatus(id, 'exception');
+    await recordEvent('exception', id);
+    const decision = await getDecision(id);
     if (decision) {
       await replaceWithCard(respond, decision, `⚖️ Marked as *exception*: ${decision.statement}`);
     } else {
@@ -291,7 +291,7 @@ export async function handleRunAudit({ ack, body, client, logger }) {
     }
     try {
       const now = Date.now();
-      const activeCount = listDecisions({ status: ['active', 'confirmed'], limit: 60 }).filter((d) =>
+      const activeCount = (await listDecisions({ status: ['active', 'confirmed'], limit: 60 })).filter((d) =>
         isEnforceable(d, now),
       ).length;
       await client.chat.postMessage({
@@ -320,10 +320,10 @@ export async function handleAuditSupersede({ ack, body, respond, logger }) {
   await ack();
   try {
     const id = actionValue(body);
-    const decision = id ? getDecision(id) : null;
+    const decision = id ? await getDecision(id) : null;
     if (id) {
-      supersede(id, null);
-      recordEvent('superseded', id);
+      await supersede(id, null);
+      await recordEvent('superseded', id);
     }
     await respond({
       replace_original: false,
@@ -353,7 +353,7 @@ export async function handleAuditDismiss({ ack, body, respond, logger }) {
       parsed = {};
     }
     if (parsed.aId && parsed.bId) {
-      recordAuditDismissal(parsed.aId, parsed.bId);
+      await recordAuditDismissal(parsed.aId, parsed.bId);
     }
     await respond({
       replace_original: false,
@@ -379,8 +379,8 @@ export async function handleNotDecision({ ack, body, respond, logger }) {
     // distinct 'capture_dismissed' kind (NOT 'dismissed', which counts alert
     // dismissals) so rejecting a capture never pollutes the alert-precision stat.
     if (id) {
-      dismissDecision(id);
-      recordEvent('capture_dismissed', id);
+      await dismissDecision(id);
+      await recordEvent('capture_dismissed', id);
     }
     await respond({
       replace_original: true,

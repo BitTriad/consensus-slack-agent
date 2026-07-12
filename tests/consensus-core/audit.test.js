@@ -17,25 +17,25 @@ describe('auditPairKey normalization', () => {
 });
 
 describe('audit dismissal round-trip', () => {
-  it('records a pair and recognizes it in either order; unrelated pairs are not dismissed', () => {
+  it('records a pair and recognizes it in either order; unrelated pairs are not dismissed', async () => {
     const a = `dec-${randomUUID()}`;
     const b = `dec-${randomUUID()}`;
     const c = `dec-${randomUUID()}`;
 
-    assert.strictEqual(isAuditPairDismissed(a, b), false);
+    assert.strictEqual(await isAuditPairDismissed(a, b), false);
 
-    recordAuditDismissal(a, b);
+    await recordAuditDismissal(a, b);
 
     // Recognized regardless of argument order.
-    assert.strictEqual(isAuditPairDismissed(a, b), true);
-    assert.strictEqual(isAuditPairDismissed(b, a), true);
+    assert.strictEqual(await isAuditPairDismissed(a, b), true);
+    assert.strictEqual(await isAuditPairDismissed(b, a), true);
 
     // A different pair sharing one id is still not dismissed.
-    assert.strictEqual(isAuditPairDismissed(a, c), false);
+    assert.strictEqual(await isAuditPairDismissed(a, c), false);
 
     // Idempotent: recording again does not throw and stays dismissed.
-    recordAuditDismissal(b, a);
-    assert.strictEqual(isAuditPairDismissed(a, b), true);
+    await recordAuditDismissal(b, a);
+    assert.strictEqual(await isAuditPairDismissed(a, b), true);
   });
 });
 
