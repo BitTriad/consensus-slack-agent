@@ -9,7 +9,7 @@
 **The first ambient consistency layer for Slack — a contradiction firewall for organizational memory.**
 
 [![CI](https://github.com/BitTriad/consensus-slack-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/BitTriad/consensus-slack-agent/actions/workflows/ci.yml)
-[![Eval](https://img.shields.io/badge/eval-hosted%2057%2F58%20%C2%B7%20P%201.000%20%C2%B7%209%2F9%20injections-brightgreen)](consensus-core/eval/EVAL-RESULTS-hosted.txt)
+[![Eval](https://img.shields.io/badge/eval-hosted%2057%2F58%20%C2%B7%20P%201.000%20%C2%B7%20R%200.964%20%C2%B7%209%2F9%20injections-brightgreen)](consensus-core/eval/EVAL-RESULTS-hosted.txt)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Slack Platform](https://img.shields.io/badge/Slack-Agents%20%C2%B7%20MCP%20%C2%B7%20RTS-4A154B?logo=slack)](https://docs.slack.dev/ai/)
 
