@@ -45,6 +45,18 @@ Built for the **Slack Agent Builder Challenge 2026** (Track 1: Best New Slack Ag
 | 📝 **Proposed vs. active governance** — a decision from an untrusted channel stays *proposed* until an authorized owner Confirms it.<br/><img src="docs/images/proposed-card.png" alt="Proposed decision with Confirm/Reject" /> | 🔍 **Consistency audit** — two-stage sweep surfaces a latent-conflict pair of standing decisions (Sales guarantees API v1 vs. Engineering sunsets it).<br/><img src="docs/images/audit-report.png" alt="Consistency audit report" /> |
 | 🏠 **App Home dashboard** — permission-filtered decision log with lifecycle badges and tracked precision.<br/><img src="docs/images/app-home.png" alt="App Home dashboard" /> | |
 
+## Try it in 3 minutes
+
+_Judges: it's live in our sandbox, and nothing below is scripted. (Self-hosting? The same steps work once your instance is running.)_
+
+1. **Capture** — post in any channel: `Decision: all demo scripts must be reviewed before recording.` → a 📌 **Decision captured** card appears in-thread (~15s).
+2. **Contradict it — from a different channel** — in `#random`, casually type: `gonna record the new demo without review, no time` → you get a *private* ⚠️ alert quoting the original decision, with a confidence score and **Show reasoning · Not a conflict · This is intentional**.
+3. **Teach it** — click **Not a conflict** on any alert → Consensus remembers and won't flag that pairing again.
+4. **Ask for provenance** — `@Consensus what have we decided about databases?` → a grounded answer with permalinks (ledger + live Real-Time Search).
+5. **Open the dashboard** — Consensus in the sidebar → **Home** tab → the permission-filtered decision log, alerts fired, and tracked precision.
+
+> **The showpiece — permission redaction.** Decisions from a _private_ channel are guarded too, but an alert about one is **redacted for non-members** — no statement, no channel, no link. Ask about a decision from a channel you're not a member of, and Consensus refuses. Permission-aware, fail-closed.
+
 ## Measured, not claimed
 
 The contradiction judge ships with an eval harness — **58 hand-labeled cases** including scope-different near-misses, sarcasm, hypotheticals, negation traps, and **9 adversarial prompt-injection attacks** (including Unicode-homoglyph, HTML-entity, and zero-width/RTL-override delimiter-break attempts):
